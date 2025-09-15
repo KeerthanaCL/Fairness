@@ -115,10 +115,20 @@ class AnalysisService:
             train_df = self.file_handler.load_dataset(training_path)
             model = self.file_handler.load_model(model_path)
             
+            # Store model and data in analysis for later use
+            analysis["model"] = model
+            analysis["train_df"] = train_df
+            
             # Load test data if provided
             test_df = None
             if testing_path:
                 test_df = self.file_handler.load_dataset(testing_path)
+                logger.info(f"Test dataset loaded successfully with {len(test_df)} rows")
+            else:
+                logger.warning("No test dataset provided - fairness evaluation will use training data (not recommended)")
+            
+            # Store test data in analysis
+            analysis["test_df"] = test_df
             
             await self._update_step(analysis_id, "file_validation", AnalysisStatus.COMPLETED, 20)
             
@@ -145,21 +155,31 @@ class AnalysisService:
             detected_attrs = [sf.name for sf in sensitive_features_result.detectedFeatures]
             sensitive_attrs = request.sensitive_attributes or detected_attrs
             
-            # Calculate fairness metrics
-            feature_columns = [col for col in train_df.columns if col != request.target_column]
+            # Calculate fairness metrics - use test data if available, otherwise fall back to training data
+            evaluation_df = test_df if test_df is not None else train_df
+            dataset_type = "test" if test_df is not None else "training"
+            logger.info(f"Using {dataset_type} dataset for fairness metrics calculation")
+            
+            feature_columns = [col for col in evaluation_df.columns if col != request.target_column]
             fairness_results = self.fairness_metrics.calculate_all_metrics(
-                train_df, model, sensitive_attrs, request.target_column, feature_columns
+                evaluation_df, model, sensitive_attrs, request.target_column, feature_columns
             )
             
             analysis["results"]["fairness_metrics"] = fairness_results
             await self._update_step(analysis_id, "fairness_metrics_calculation", AnalysisStatus.COMPLETED, 80)
             
-            # Step 4: Mitigation strategy generation
+            # Step 4: Mitigation strategy generation with real evaluation
             await self._update_step(analysis_id, "mitigation_strategy_generation", AnalysisStatus.RUNNING, 90)
             
-            # Generate mitigation strategies
+            # Generate mitigation strategies with real performance evaluation
+            logger.info("Generating mitigation strategies with real model evaluation")
             mitigation_strategies = self._generate_mitigation_strategies(
-                sensitive_features_result, fairness_results
+                sensitive_features_result, 
+                fairness_results,
+                model=analysis["model"],
+                train_df=analysis["train_df"], 
+                test_df=analysis["test_df"],
+                target_column=request.target_column
             )
             
             analysis["results"]["mitigation_strategies"] = mitigation_strategies
@@ -360,72 +380,290 @@ class AnalysisService:
         
         return int(remaining)
     
-    def _generate_mitigation_strategies(self, sensitive_features, fairness_results) -> MitigationStrategiesResponse:
-        """Generate mitigation strategy recommendations based on detected bias"""
+    def _generate_mitigation_strategies(self, sensitive_features, fairness_results, model=None, train_df=None, test_df=None, target_column=None) -> MitigationStrategiesResponse:
+        """Generate comprehensive mitigation strategy recommendations with real performance calculations"""
         from app.models.schemas import MitigationStrategy, StrategyCategory
-        import random
         
         strategies = []
         
-        # Calculate average bias severity from fairness results
-        avg_bias_severity = self._calculate_bias_severity(fairness_results)
+        # Get all detected sensitive attributes
+        all_attrs = [sf.name for sf in sensitive_features.detectedFeatures]
         
-        # Default strategies based on bias severity
+        # If we have real data, calculate actual performance for each strategy
+        if model is not None and train_df is not None and test_df is not None and target_column is not None:
+            logger.info("Calculating real performance metrics for all mitigation strategies")
+            return self._generate_strategies_with_real_evaluation(
+                sensitive_features, fairness_results, model, train_df, test_df, target_column, all_attrs
+            )
+        
+        # Fallback to estimation-based generation (original behavior)
+        logger.warning("No model/data provided, using estimation-based strategy generation")
+        avg_bias_severity = self._calculate_bias_severity(fairness_results)
         high_bias_attrs = [sf.name for sf in sensitive_features.detectedFeatures 
                           if sf.sensitivityLevel == "Highly Sensitive"]
         
-        if high_bias_attrs:
-            # Calculate real improvement estimates based on bias severity
-            base_improvement = min(50.0, avg_bias_severity * 1.5)
-            
-            # Recommend preprocessing for high bias
-            strategies.append(MitigationStrategy(
+        # Calculate realistic improvement estimates based on bias severity
+        high_bias_improvement = min(45.0, avg_bias_severity * 1.4)
+        medium_bias_improvement = min(35.0, avg_bias_severity * 1.1)
+        low_bias_improvement = min(25.0, avg_bias_severity * 0.9)
+        
+        # PREPROCESSING STRATEGIES (1-3)
+        strategies.extend([
+            # 1. Data Reweighing - Most effective for high bias
+            MitigationStrategy(
                 name="Reweighing",
                 category=StrategyCategory.PREPROCESSING,
-                fairnessImprovement=round(base_improvement + random.uniform(-5, 5), 1),
-                accuracyImpact=round(-base_improvement * 0.06 + random.uniform(-0.5, 0.5), 1),
-                precisionImpact=round(-base_improvement * 0.05 + random.uniform(-0.3, 0.3), 1),
-                recallImpact=round(-base_improvement * 0.04 + random.uniform(-0.3, 0.3), 1),
-                f1Impact=round(-base_improvement * 0.055 + random.uniform(-0.4, 0.4), 1),
-                stars=3 if base_improvement > 30 else 2,
-                recommendation="Highly Recommended" if base_improvement > 30 else "Recommended",
-                description="Adjusts instance weights to reduce bias in training data. Most effective for high bias scenarios.",
-                targetAttributes=high_bias_attrs
-            ))
+                fairnessImprovement=round(high_bias_improvement, 1),
+                accuracyImpact=round(-high_bias_improvement * 0.06, 1),
+                precisionImpact=round(-high_bias_improvement * 0.05, 1),
+                recallImpact=round(-high_bias_improvement * 0.04, 1),
+                f1Impact=round(-high_bias_improvement * 0.055, 1),
+                stars=3 if high_bias_improvement > 30 else 2,
+                recommendation="Highly Recommended" if high_bias_improvement > 30 else "Recommended",
+                description="Adjusts instance weights to reduce bias in training data. Most effective for datasets with imbalanced sensitive groups.",
+                targetAttributes=all_attrs
+            ),
+            
+            # 2. Disparate Impact Remover - Good for direct discrimination
+            MitigationStrategy(
+                name="Disparate Impact Remover",
+                category=StrategyCategory.PREPROCESSING,
+                fairnessImprovement=round(medium_bias_improvement, 1),
+                accuracyImpact=round(-medium_bias_improvement * 0.08, 1),
+                precisionImpact=round(-medium_bias_improvement * 0.07, 1),
+                recallImpact=round(-medium_bias_improvement * 0.06, 1),
+                f1Impact=round(-medium_bias_improvement * 0.075, 1),
+                stars=2 if medium_bias_improvement > 25 else 1,
+                recommendation="Recommended" if medium_bias_improvement > 25 else "Consider",
+                description="Removes features that cause disparate impact. Ideal when direct discrimination through features is suspected.",
+                targetAttributes=all_attrs
+            ),
+            
+            # 3. Data Augmentation - Good for small datasets
+            MitigationStrategy(
+                name="Data Augmentation",
+                category=StrategyCategory.PREPROCESSING,
+                fairnessImprovement=round(low_bias_improvement, 1),
+                accuracyImpact=round(low_bias_improvement * 0.04, 1),  # Positive impact
+                precisionImpact=round(low_bias_improvement * 0.03, 1),
+                recallImpact=round(low_bias_improvement * 0.05, 1),
+                f1Impact=round(low_bias_improvement * 0.04, 1),
+                stars=2 if len(all_attrs) > 1 else 1,
+                recommendation="Good for Small Datasets" if len(all_attrs) > 1 else "Limited Benefit",
+                description="Augments underrepresented groups with synthetic data. Most effective for small datasets with underrepresented groups.",
+                targetAttributes=all_attrs
+            )
+        ])
         
-        # Always include some standard strategies with calculated values
-        base_improvement = min(40.0, avg_bias_severity * 1.2)
-        
+        # IN-PROCESSING STRATEGIES (4-5)
         strategies.extend([
+            # 4. Fairness Regularization - Balanced approach
+            MitigationStrategy(
+                name="Fairness Regularization",
+                category=StrategyCategory.IN_PROCESSING,
+                fairnessImprovement=round(medium_bias_improvement * 1.1, 1),
+                accuracyImpact=round(-medium_bias_improvement * 0.05, 1),
+                precisionImpact=round(-medium_bias_improvement * 0.04, 1),
+                recallImpact=round(-medium_bias_improvement * 0.04, 1),
+                f1Impact=round(-medium_bias_improvement * 0.045, 1),
+                stars=3 if medium_bias_improvement > 25 else 2,
+                recommendation="Highly Recommended" if medium_bias_improvement > 25 else "Recommended",
+                description="Adds fairness penalty to model training objective. Integrates fairness constraints into model optimization.",
+                targetAttributes=all_attrs
+            ),
+            
+            # 5. Adversarial Debiasing - Advanced technique
             MitigationStrategy(
                 name="Adversarial Debiasing",
                 category=StrategyCategory.IN_PROCESSING,
-                fairnessImprovement=round(base_improvement + random.uniform(-3, 3), 1),
-                accuracyImpact=round(-base_improvement * 0.04 + random.uniform(-0.3, 0.3), 1),
-                precisionImpact=round(-base_improvement * 0.03 + random.uniform(-0.2, 0.2), 1),
-                recallImpact=round(-base_improvement * 0.03 + random.uniform(-0.25, 0.25), 1),
-                f1Impact=round(-base_improvement * 0.035 + random.uniform(-0.25, 0.25), 1),
-                stars=2 if base_improvement > 20 else 1,
-                recommendation="Recommended" if base_improvement > 20 else "Consider",
-                description="Uses adversarial learning to reduce bias during model training.",
-                targetAttributes=[sf.name for sf in sensitive_features.detectedFeatures]
-            ),
+                fairnessImprovement=round(high_bias_improvement * 0.9, 1),
+                accuracyImpact=round(-high_bias_improvement * 0.04, 1),
+                precisionImpact=round(-high_bias_improvement * 0.03, 1),
+                recallImpact=round(-high_bias_improvement * 0.03, 1),
+                f1Impact=round(-high_bias_improvement * 0.035, 1),
+                stars=2 if high_bias_improvement > 20 else 1,
+                recommendation="Advanced Option" if high_bias_improvement > 20 else "Complex Implementation",
+                description="Uses adversarial training to remove bias. Can handle complex bias patterns but requires more computational resources.",
+                targetAttributes=all_attrs
+            )
+        ])
+        
+        # POST-PROCESSING STRATEGIES (6-8)
+        strategies.extend([
+            # 6. Threshold Optimization - Quick and effective
             MitigationStrategy(
-                name="Calibrated Equalized Odds",
+                name="Threshold Optimization",
                 category=StrategyCategory.POST_PROCESSING,
-                fairnessImprovement=round(base_improvement * 0.8 + random.uniform(-2, 2), 1),
-                accuracyImpact=round(-base_improvement * 0.025 + random.uniform(-0.2, 0.2), 1),
-                precisionImpact=round(-base_improvement * 0.02 + random.uniform(-0.15, 0.15), 1),
-                recallImpact=round(-base_improvement * 0.02 + random.uniform(-0.18, 0.18), 1),
-                f1Impact=round(-base_improvement * 0.025 + random.uniform(-0.18, 0.18), 1),
+                fairnessImprovement=round(medium_bias_improvement * 0.8, 1),
+                accuracyImpact=round(-medium_bias_improvement * 0.03, 1),
+                precisionImpact=round(-medium_bias_improvement * 0.025, 1),
+                recallImpact=round(-medium_bias_improvement * 0.02, 1),
+                f1Impact=round(-medium_bias_improvement * 0.03, 1),
+                stars=3,
+                recommendation="Quick Implementation",
+                description="Optimizes decision thresholds for each sensitive group. Works with existing models and quick to implement.",
+                targetAttributes=all_attrs
+            ),
+            
+            # 7. Calibration Adjustment - For probability models
+            MitigationStrategy(
+                name="Calibration Adjustment",
+                category=StrategyCategory.POST_PROCESSING,
+                fairnessImprovement=round(low_bias_improvement * 1.2, 1),
+                accuracyImpact=round(-low_bias_improvement * 0.02, 1),
+                precisionImpact=round(-low_bias_improvement * 0.015, 1),
+                recallImpact=round(-low_bias_improvement * 0.015, 1),
+                f1Impact=round(-low_bias_improvement * 0.02, 1),
                 stars=2,
-                recommendation="Good Option",
-                description="Post-processes predictions to achieve equalized odds between groups.",
-                targetAttributes=[sf.name for sf in sensitive_features.detectedFeatures]
+                recommendation="For Probability Models",
+                description="Calibrates predictions to ensure fairness across groups. Ideal for probability-based models with calibration issues.",
+                targetAttributes=all_attrs
+            ),
+            
+            # 8. Equalized Odds Post-processing - Targeted fairness
+            MitigationStrategy(
+                name="Equalized Odds Post-processing",
+                category=StrategyCategory.POST_PROCESSING,
+                fairnessImprovement=round(medium_bias_improvement * 0.9, 1),
+                accuracyImpact=round(-medium_bias_improvement * 0.025, 1),
+                precisionImpact=round(-medium_bias_improvement * 0.02, 1),
+                recallImpact=round(-medium_bias_improvement * 0.02, 1),
+                f1Impact=round(-medium_bias_improvement * 0.025, 1),
+                stars=2,
+                recommendation="Targeted Fairness",
+                description="Adjusts predictions to achieve equalized odds across groups. Directly optimizes for equalized odds fairness metric.",
+                targetAttributes=all_attrs
             )
         ])
         
         return MitigationStrategiesResponse(strategies=strategies)
+    
+    def _generate_strategies_with_real_evaluation(
+        self, 
+        sensitive_features, 
+        fairness_results, 
+        model, 
+        train_df, 
+        test_df, 
+        target_column, 
+        all_attrs
+    ) -> MitigationStrategiesResponse:
+        """Generate strategies with real performance evaluation using actual model and data"""
+        from app.models.schemas import MitigationStrategy, StrategyCategory
+        from app.services.mitigation_service import MitigationService
+        
+        strategies = []
+        mitigation_service = MitigationService()
+        
+        # Define all 8 strategies to evaluate
+        strategy_definitions = [
+            ("Reweighing", StrategyCategory.PREPROCESSING, "Adjusts instance weights to reduce bias in training data. Most effective for datasets with imbalanced sensitive groups."),
+            ("Disparate Impact Remover", StrategyCategory.PREPROCESSING, "Removes features that cause disparate impact. Ideal when direct discrimination through features is suspected."),
+            ("Data Augmentation", StrategyCategory.PREPROCESSING, "Augments underrepresented groups with synthetic data. Most effective for small datasets with underrepresented groups."),
+            ("Fairness Regularization", StrategyCategory.IN_PROCESSING, "Adds fairness penalty to model training objective. Integrates fairness constraints into model optimization."),
+            ("Adversarial Debiasing", StrategyCategory.IN_PROCESSING, "Uses adversarial training to remove bias. Can handle complex bias patterns but requires more computational resources."),
+            ("Threshold Optimization", StrategyCategory.POST_PROCESSING, "Optimizes decision thresholds for each sensitive group. Works with existing models and quick to implement."),
+            ("Calibration Adjustment", StrategyCategory.POST_PROCESSING, "Calibrates predictions to ensure fairness across groups. Ideal for probability-based models with calibration issues."),
+            ("Equalized Odds Post-processing", StrategyCategory.POST_PROCESSING, "Adjusts predictions to achieve equalized odds across groups. Directly optimizes for equalized odds fairness metric.")
+        ]
+        
+        logger.info(f"Evaluating {len(strategy_definitions)} mitigation strategies with real model and data")
+        
+        for strategy_name, category, description in strategy_definitions:
+            try:
+                logger.info(f"Evaluating strategy: {strategy_name}")
+                
+                # Apply the strategy and get real results
+                result = mitigation_service.apply_mitigation_strategy(
+                    strategy_name=strategy_name,
+                    model=model,
+                    train_df=train_df,
+                    test_df=test_df,
+                    target_column=target_column,
+                    sensitive_attributes=all_attrs
+                )
+                
+                # Extract real performance metrics
+                before_performance = result["before"]["performance"]
+                after_performance = result["after"]["performance"]
+                improvement = result["improvement"]
+                
+                # Calculate real impacts (as percentages)
+                fairness_improvement = improvement.get("fairness_improvement", 0)
+                accuracy_impact = improvement.get("accuracy_change", 0) * 100
+                precision_impact = improvement.get("precision_change", 0) * 100
+                recall_impact = improvement.get("recall_change", 0) * 100
+                f1_impact = improvement.get("f1_change", 0) * 100
+                
+                # Determine recommendation based on real results
+                stars, recommendation = self._calculate_strategy_recommendation(
+                    fairness_improvement, accuracy_impact, f1_impact
+                )
+                
+                # Create strategy with real calculated values
+                strategy = MitigationStrategy(
+                    name=strategy_name,
+                    category=category,
+                    fairnessImprovement=round(fairness_improvement, 1),
+                    accuracyImpact=round(accuracy_impact, 1),
+                    precisionImpact=round(precision_impact, 1),
+                    recallImpact=round(recall_impact, 1),
+                    f1Impact=round(f1_impact, 1),
+                    stars=stars,
+                    recommendation=recommendation,
+                    description=description,
+                    targetAttributes=all_attrs
+                )
+                
+                strategies.append(strategy)
+                logger.info(f"Strategy {strategy_name} evaluated: {fairness_improvement:.1f}% fairness improvement")
+                
+            except Exception as e:
+                logger.error(f"Failed to evaluate strategy {strategy_name}: {str(e)}")
+                # Add fallback strategy with estimated values
+                strategies.append(self._create_fallback_strategy(strategy_name, category, description, all_attrs))
+        
+        # Sort strategies by effectiveness (fairness improvement and minimal performance loss)
+        strategies.sort(key=lambda s: (-s.fairnessImprovement, s.accuracyImpact), reverse=False)
+        
+        logger.info(f"Successfully evaluated {len(strategies)} strategies with real performance metrics")
+        return MitigationStrategiesResponse(strategies=strategies)
+    
+    def _calculate_strategy_recommendation(self, fairness_improvement, accuracy_impact, f1_impact):
+        """Calculate strategy recommendation based on real performance metrics"""
+        
+        # Calculate overall effectiveness score
+        # Higher fairness improvement is good, lower performance loss is good
+        effectiveness_score = fairness_improvement - abs(accuracy_impact) - abs(f1_impact)
+        
+        if effectiveness_score > 25 and fairness_improvement > 30:
+            return 3, "Highly Recommended"
+        elif effectiveness_score > 15 and fairness_improvement > 20:
+            return 3, "Recommended" 
+        elif effectiveness_score > 5 and fairness_improvement > 10:
+            return 2, "Good Option"
+        elif fairness_improvement > 5:
+            return 2, "Consider"
+        else:
+            return 1, "Limited Benefit"
+    
+    def _create_fallback_strategy(self, name, category, description, all_attrs):
+        """Create fallback strategy when real evaluation fails"""
+        from app.models.schemas import MitigationStrategy
+        
+        return MitigationStrategy(
+            name=name,
+            category=category,
+            fairnessImprovement=20.0,  # Conservative estimate
+            accuracyImpact=-1.0,
+            precisionImpact=-1.0,
+            recallImpact=-1.0,
+            f1Impact=-1.0,
+            stars=2,
+            recommendation="Evaluation Failed",
+            description=f"{description} (Performance could not be calculated)",
+            targetAttributes=all_attrs
+        )
     
     def _calculate_bias_severity(self, fairness_results) -> float:
         """Calculate average bias severity from fairness metrics"""

@@ -165,6 +165,12 @@ export const FairnessAPIService = {
     return service.getBeforeAfterComparison(analysisId, strategy);
   },
 
+  // Real Mitigation Application
+  async applyRealMitigation(analysisId, strategyName) {
+    const service = await serviceFactory.getService();
+    return service.applyRealMitigation(analysisId, strategyName);
+  },
+
   // Configuration APIs
   async getAvailableSensitiveAttributes() {
     const service = await serviceFactory.getService();

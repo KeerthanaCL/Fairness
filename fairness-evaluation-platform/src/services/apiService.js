@@ -255,6 +255,20 @@ export const APIService = {
     }
   },
 
+  // Real Mitigation Application
+  async applyRealMitigation(analysisId, strategyName) {
+    try {
+      const params = new URLSearchParams({
+        analysis_id: analysisId,
+        strategy_name: strategyName
+      });
+      return await apiClient.post(`/analysis/apply-mitigation?${params}`);
+    } catch (error) {
+      console.error('Real mitigation application failed:', error);
+      throw new APIError('Failed to apply real mitigation', error.status, error.response);
+    }
+  },
+
   // Health Check
   async healthCheck() {
     try {

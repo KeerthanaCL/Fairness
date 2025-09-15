@@ -3,6 +3,10 @@ import {
   Star,
   TrendingUp,
   TrendingDown,
+  Play,
+  AlertCircle,
+  CheckCircle,
+  Clock
 } from 'lucide-react';
 import FairnessRadarChart from '../visualizations/FairnessRadarChart';
 import ComparisonBarChart from '../visualizations/ComparisonBarChart';
@@ -22,6 +26,12 @@ const MitigationStrategyAnalysis = ({ data, analysisId }) => {
   const [fullApiData, setFullApiData] = useState(null); // Store full API response
   const [attributesError, setAttributesError] = useState(null); // Error state for attributes
   const [comparisonError, setComparisonError] = useState(null); // Error state for comparisons
+  
+  // Real mitigation states
+  const [realMitigationData, setRealMitigationData] = useState(null);
+  const [loadingRealMitigation, setLoadingRealMitigation] = useState(false);
+  const [realMitigationError, setRealMitigationError] = useState(null);
+  const [showRealResults, setShowRealResults] = useState(false);
 
   // Debug: Log the incoming data
   console.log('MitigationStrategyAnalysis received data:', data);
@@ -139,6 +149,41 @@ const MitigationStrategyAnalysis = ({ data, analysisId }) => {
 
     fetchBeforeAfterData();
   }, [analysisId, selectedStrategy, selectedAttribute]);
+
+  // Real mitigation handler
+  const handleApplyRealMitigation = async () => {
+    if (!analysisId || !selectedStrategy) {
+      setRealMitigationError('Analysis ID and strategy selection required.');
+      return;
+    }
+
+    setLoadingRealMitigation(true);
+    setRealMitigationError(null);
+    
+    try {
+      console.log(`Applying real mitigation: ${selectedStrategy} for analysis ${analysisId}`);
+      
+      const result = await FairnessAPIService.applyRealMitigation(analysisId, selectedStrategy);
+      console.log('Real mitigation result:', result);
+      
+      setRealMitigationData(result);
+      setShowRealResults(true);
+      
+      // Update the comparison data with real results
+      if (result.groupComparisons) {
+        const selectedAttrData = result.groupComparisons[selectedAttribute];
+        if (selectedAttrData) {
+          setBeforeAfterData(selectedAttrData);
+        }
+      }
+      
+    } catch (error) {
+      console.error('Real mitigation failed:', error);
+      setRealMitigationError(`Failed to apply real mitigation: ${error.message || 'Unknown error'}`);
+    } finally {
+      setLoadingRealMitigation(false);
+    }
+  };
 
   // Debug: Log the strategies array
   console.log('Strategies array:', strategies);
@@ -261,8 +306,21 @@ const MitigationStrategyAnalysis = ({ data, analysisId }) => {
     'Post-processing': getCategoryStrategies('Post-processing').sort((a, b) => b.fairnessImprovement - a.fairnessImprovement)[0] || null,
   };
 
-  // Real visualization data from API (no hardcoded fallbacks)
-  const visualizationData = fullApiData ? {
+  // Real visualization data from API (prioritize real mitigation data when available)
+  const visualizationData = (showRealResults && realMitigationData) ? {
+    radar: {
+      before: realMitigationData.fairnessMetrics?.before || [],
+      after: realMitigationData.fairnessMetrics?.after || [],
+      metrics: realMitigationData.fairnessMetrics?.metrics || [],
+    },
+    performance: {
+      before: realMitigationData.performance?.before || null,
+      after: realMitigationData.performance?.after || null,
+    },
+    groupComparison: beforeAfterData || null,
+    // Add attribute comparison data for multi-attribute summary
+    attributeComparison: realMitigationData.groupComparisons || {},
+  } : fullApiData ? {
     radar: {
       before: fullApiData.fairnessMetrics?.before || [],
       after: fullApiData.fairnessMetrics?.after || [],
@@ -277,9 +335,13 @@ const MitigationStrategyAnalysis = ({ data, analysisId }) => {
     attributeComparison: fullApiData.groupComparisons || {},
   } : null;
 
-  // Use backend-calculated overall fairness scores (no frontend fallback calculation)
-  const overallFairnessScoreBefore = fullApiData?.fairnessMetrics?.overallScoreBefore;
-  const overallFairnessScoreAfter = fullApiData?.fairnessMetrics?.overallScoreAfter;
+  // Use backend-calculated overall fairness scores (prioritize real mitigation results)
+  const overallFairnessScoreBefore = (showRealResults && realMitigationData) 
+    ? realMitigationData?.fairnessMetrics?.overallScoreBefore
+    : fullApiData?.fairnessMetrics?.overallScoreBefore;
+  const overallFairnessScoreAfter = (showRealResults && realMitigationData)
+    ? realMitigationData?.fairnessMetrics?.overallScoreAfter
+    : fullApiData?.fairnessMetrics?.overallScoreAfter;
 
   // Determine fairness score labels
   const getFairnessScoreLabel = (score) => {
@@ -296,9 +358,86 @@ const MitigationStrategyAnalysis = ({ data, analysisId }) => {
 
   return (
     <div>
-      <h1 className="text-2xl font-bold text-gray-900 dark:text-gray-100 mb-6">
-        Mitigation Strategy Analysis
-      </h1>
+      <div className="flex items-center justify-between mb-6">
+        <h1 className="text-2xl font-bold text-gray-900 dark:text-gray-100">
+          Mitigation Strategy Analysis
+        </h1>
+        
+        {/* Real Mitigation Button - Top Level */}
+        <div className="flex items-center gap-4">
+          {showRealResults && (
+            <div className="flex items-center gap-2 text-green-600 dark:text-green-400">
+              <CheckCircle className="w-5 h-5" />
+              <span className="text-sm font-medium">Real Results Applied</span>
+            </div>
+          )}
+          
+          <button
+            onClick={handleApplyRealMitigation}
+            disabled={loadingRealMitigation || !analysisId || !selectedStrategy}
+            className={`flex items-center gap-2 px-6 py-3 rounded-lg font-medium transition-colors ${
+              loadingRealMitigation
+                ? 'bg-gray-400 text-white cursor-not-allowed'
+                : showRealResults
+                ? 'bg-green-600 hover:bg-green-700 text-white'
+                : 'bg-blue-600 hover:bg-blue-700 text-white'
+            }`}
+          >
+            {loadingRealMitigation ? (
+              <>
+                <Clock className="w-5 h-5 animate-spin" />
+                Processing Real Mitigation...
+              </>
+            ) : showRealResults ? (
+              <>
+                <CheckCircle className="w-5 h-5" />
+                Re-apply Real Mitigation
+              </>
+            ) : (
+              <>
+                <Play className="w-5 h-5" />
+                Apply Real Mitigation
+              </>
+            )}
+          </button>
+        </div>
+      </div>
+      
+      {/* Real Mitigation Status Messages */}
+      {realMitigationError && (
+        <div className="mb-6 bg-red-50 dark:bg-red-900/20 rounded-lg p-4">
+          <div className="flex items-center gap-2 text-red-600 dark:text-red-400">
+            <AlertCircle className="w-5 h-5" />
+            <span className="font-medium">Real Mitigation Error:</span>
+          </div>
+          <p className="text-red-700 dark:text-red-300 mt-1 text-sm">{realMitigationError}</p>
+        </div>
+      )}
+      
+      {showRealResults && realMitigationData && (
+        <div className="mb-6 bg-green-50 dark:bg-green-900/20 rounded-lg p-4">
+          <div className="flex items-center gap-2 text-green-600 dark:text-green-400 mb-2">
+            <CheckCircle className="w-5 h-5" />
+            <span className="font-medium">Real Mitigation Applied Successfully!</span>
+          </div>
+          <p className="text-green-700 dark:text-green-300 text-sm">
+            The strategy <strong>"{selectedStrategy}"</strong> has been applied to your model and data. 
+            All results below show <strong>actual improvements</strong>, not simulations.
+          </p>
+        </div>
+      )}
+      
+      {!showRealResults && (
+        <div className="mb-6 bg-blue-50 dark:bg-blue-900/20 rounded-lg p-4">
+          <div className="flex items-center gap-2 text-blue-600 dark:text-blue-400 mb-2">
+            <AlertCircle className="w-5 h-5" />
+            <span className="font-medium">Strategy Recommendations Available</span>
+          </div>
+          <p className="text-blue-700 dark:text-blue-300 text-sm">
+            Review the mitigation strategies below, select one, then click <strong>"Apply Real Mitigation"</strong> above to see actual improvements instead of simulated results.
+          </p>
+        </div>
+      )}
 
       {/* Strategy Performance Table */}
       <div className="bg-white dark:bg-gray-800 rounded-lg shadow-sm border border-gray-200 dark:border-gray-700 mb-8">
@@ -417,7 +556,13 @@ const MitigationStrategyAnalysis = ({ data, analysisId }) => {
       {/* Before/After Model Comparison Visualizations */}
       <div className="bg-white dark:bg-gray-800 rounded-lg shadow-md p-6">
         <h3 className="text-lg font-bold text-gray-900 dark:text-white mb-4">
-          Before/After Model Comparison: {selectedStrategy}
+          {showRealResults ? `Real Results: ${selectedStrategy}` : `Strategy Analysis: ${selectedStrategy}`}
+          {showRealResults && (
+            <span className="ml-2 inline-flex items-center gap-1 text-green-600 dark:text-green-400 text-sm">
+              <CheckCircle className="w-4 h-4" />
+              Real
+            </span>
+          )}
         </h3>
         
         <div className="border-b border-gray-200 dark:border-gray-700 mb-6">
@@ -530,9 +675,17 @@ const MitigationStrategyAnalysis = ({ data, analysisId }) => {
               </div>
             ) : (
               <>
-                <p className="text-gray-700 dark:text-gray-300 mb-6">
-                  Fairness metrics comparison showing improvement across all dimensions:
-                </p>
+                <div className="flex items-center justify-between mb-6">
+                  <p className="text-gray-700 dark:text-gray-300">
+                    Fairness metrics comparison showing improvement across all dimensions:
+                  </p>
+                  {showRealResults && (
+                    <div className="flex items-center gap-2 text-green-600 dark:text-green-400 text-sm">
+                      <CheckCircle className="w-4 h-4" />
+                      <span className="font-medium">Real Results</span>
+                    </div>
+                  )}
+                </div>
                 
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                   {/* Radar Chart */}
@@ -606,9 +759,17 @@ const MitigationStrategyAnalysis = ({ data, analysisId }) => {
 
         {selectedTab === 2 && (
           <div>
-            <p className="text-gray-700 dark:text-gray-300 mb-6">
-              Performance metrics showing the trade-off between fairness and accuracy:
-            </p>
+            <div className="flex items-center justify-between mb-6">
+              <p className="text-gray-700 dark:text-gray-300">
+                Performance metrics showing the trade-off between fairness and accuracy:
+              </p>
+              {showRealResults && (
+                <div className="flex items-center gap-2 text-green-600 dark:text-green-400 text-sm">
+                  <CheckCircle className="w-4 h-4" />
+                  <span className="font-medium">Real Results</span>
+                </div>
+              )}
+            </div>
             
             <div className="bg-white dark:bg-gray-800 rounded-lg shadow-md overflow-hidden">
               <div className="overflow-x-auto">

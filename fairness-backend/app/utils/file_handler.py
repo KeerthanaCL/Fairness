@@ -116,7 +116,7 @@ class FileHandler:
         try:
             model_info = {
                 "type": type(model).__name__,
-                "algorithm": getattr(model, "__class__", {}).get("__name__", "Unknown"),
+                "algorithm": model.__class__.__name__,
                 "has_predict": hasattr(model, "predict"),
                 "has_predict_proba": hasattr(model, "predict_proba"),
                 "has_decision_function": hasattr(model, "decision_function")
