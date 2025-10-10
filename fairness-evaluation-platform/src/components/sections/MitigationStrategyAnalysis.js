@@ -14,11 +14,12 @@ import {
   getAttributeDisplayName
 } from '../../services/mockDataService';
 import { FairnessAPIService } from '../../services';
+import AutoPipelineSearch from './AutoPipelineSearch';
 
 const MitigationStrategyAnalysis = ({ data, analysisId }) => {
   // React hooks must be called first, before any conditional logic
   const [selectedTab, setSelectedTab] = useState(0);
-  const [selectedStrategy, setSelectedStrategy] = useState('Adversarial Debiasing');
+  const [selectedStrategy, setSelectedStrategy] = useState('');
   const [selectedAttribute, setSelectedAttribute] = useState(''); // No default hardcoded value
   const [availableAttributes, setAvailableAttributes] = useState([]); // Dynamic sensitive attributes
   const [beforeAfterData, setBeforeAfterData] = useState(null);
@@ -32,6 +33,102 @@ const MitigationStrategyAnalysis = ({ data, analysisId }) => {
   const [loadingRealMitigation, setLoadingRealMitigation] = useState(false);
   const [realMitigationError, setRealMitigationError] = useState(null);
   const [showRealResults, setShowRealResults] = useState(false);
+
+  const [pipelineStrategy, setPipelineStrategy] = useState({
+    preprocessing: '',
+    inprocessing: '',
+    postprocessing: ''
+  });
+  const [loadingPipeline, setLoadingPipeline] = useState(false);
+  const [pipelineResults, setPipelineResults] = useState(null);
+  const [pipelineError, setPipelineError] = useState(null);
+
+  // Add pipeline application handler
+  const handleApplyPipeline = async () => {
+    if (!analysisId) {
+      setPipelineError('Analysis ID is required');
+      return;
+    }
+
+    // Check if at least one strategy is selected
+    if (!pipelineStrategy.preprocessing && !pipelineStrategy.inprocessing && !pipelineStrategy.postprocessing) {
+      setPipelineError('Please select at least one mitigation strategy');
+      return;
+    }
+
+    setLoadingPipeline(true);
+    setPipelineError(null);
+    
+    try {
+      // console.log('Applying mitigation pipeline:', pipelineStrategy);
+      // Use the FairnessAPIService if available, or direct fetch
+      const apiBaseUrl = process.env.REACT_APP_API_URL || 'http://localhost:8000';
+      const url = `${apiBaseUrl}/api/analysis/apply-mitigation-pipeline`;
+
+      console.log('Calling URL:', url);
+      
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 
+          'Content-Type': 'application/json', 
+          'Accept': 'application/json'
+        },
+        body: JSON.stringify({
+          analysisId: analysisId,
+          preprocessingStrategy: pipelineStrategy.preprocessing || null,
+          inprocessingStrategy: pipelineStrategy.inprocessing || null,
+          postprocessingStrategy: pipelineStrategy.postprocessing || null
+        })
+      });
+
+      console.log('Response status:', response.status);
+      console.log('Response headers:', response.headers);
+      
+      // Read response as text first to see what we're getting
+      const responseText = await response.text();
+      console.log('Response text (first 500 chars):', responseText.substring(0, 500));
+      
+      if (!response.ok) {
+        // Try to parse as JSON, but handle if it's HTML
+        let errorMessage = `Server returned ${response.status}`;
+        try {
+          const errorData = JSON.parse(responseText);
+          errorMessage = errorData.detail || errorMessage;
+        } catch {
+          // Response is HTML (error page)
+          if (responseText.includes('<!DOCTYPE') || responseText.includes('<html')) {
+            errorMessage = `API endpoint not found or server error (${response.status}). Please check if the backend server is running and the endpoint exists.`;
+          } else {
+            errorMessage = `Server error: ${responseText.substring(0, 200)}`;
+          }
+        }
+        throw new Error(errorMessage);
+      }
+      
+      let result;
+      try {
+        result = JSON.parse(responseText);
+      } catch (parseError) {
+        console.error('Failed to parse response as JSON:', parseError);
+        throw new Error('Invalid response format from server');
+      }
+      console.log('Pipeline results:', result);
+      
+      setPipelineResults(result.pipeline);
+      
+      // Update visualization data with pipeline results
+      if (result.pipeline.final) {
+        // You can update the existing visualization data here
+        setShowRealResults(true);
+      }
+      
+    } catch (error) {
+      console.error('Pipeline application failed:', error);
+      setPipelineError(`Failed to apply pipeline: ${error.message}`);
+    } finally {
+      setLoadingPipeline(false);
+    }
+  };
 
   // Debug: Log the incoming data
   console.log('MitigationStrategyAnalysis received data:', data);
@@ -83,8 +180,10 @@ const MitigationStrategyAnalysis = ({ data, analysisId }) => {
         return;
       }
 
-      if (!selectedStrategy) {
-        setComparisonError('No mitigation strategy selected.');
+      // Only proceed if a strategy is selected and it's not empty
+      if (!selectedStrategy || selectedStrategy.trim() === '') {
+        setBeforeAfterData(null);
+        setFullApiData(null);
         return;
       }
 
@@ -96,6 +195,7 @@ const MitigationStrategyAnalysis = ({ data, analysisId }) => {
       try {
         setLoadingComparison(true);
         setComparisonError(null);
+        console.log('Fetching comparison data for strategy:', selectedStrategy);
         const result = await FairnessAPIService.getBeforeAfterComparison(analysisId, selectedStrategy);
         
         // Store the full API response
@@ -363,7 +463,7 @@ const MitigationStrategyAnalysis = ({ data, analysisId }) => {
           Mitigation Strategy Analysis
         </h1>
         
-        {/* Real Mitigation Button - Top Level */}
+        {/* Real Mitigation Button - Top Level
         <div className="flex items-center gap-4">
           {showRealResults && (
             <div className="flex items-center gap-2 text-green-600 dark:text-green-400">
@@ -400,7 +500,7 @@ const MitigationStrategyAnalysis = ({ data, analysisId }) => {
               </>
             )}
           </button>
-        </div>
+        </div> */}
       </div>
       
       {/* Real Mitigation Status Messages */}
@@ -439,129 +539,329 @@ const MitigationStrategyAnalysis = ({ data, analysisId }) => {
         </div>
       )}
 
-      {/* Strategy Performance Table */}
-      <div className="bg-white dark:bg-gray-800 rounded-lg shadow-sm border border-gray-200 dark:border-gray-700 mb-8">
-        <div className="p-6">
-          <h2 className="text-lg font-semibold text-gray-900 dark:text-gray-100 mb-4">
-            Strategy Performance Comparison
-          </h2>
-        </div>
-        <div className="overflow-x-auto">
-          <table className="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
-            <thead className="bg-gray-50 dark:bg-gray-900/50">
-              <tr>
-                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Strategy</th>
-                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Category</th>
-                <th className="px-6 py-3 text-center text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Fairness Improvement</th>
-                <th className="px-6 py-3 text-center text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Accuracy Impact</th>
-                <th className="px-6 py-3 text-center text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Precision Impact</th>
-                <th className="px-6 py-3 text-center text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">F1 Impact</th>
-                <th className="px-6 py-3 text-center text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Recommendation</th>
-              </tr>
-            </thead>
-            <tbody className="bg-white dark:bg-gray-800 divide-y divide-gray-200 dark:divide-gray-700">
-              {validStrategies.map((strategy) => (
-                <tr
-                  key={strategy.name}
-                  className={`hover:bg-gray-50 dark:hover:bg-gray-700/50 cursor-pointer transition-colors ${
-                    selectedStrategy === strategy.name ? 'bg-blue-50 dark:bg-blue-900/20' : ''
-                  }`}
-                  onClick={() => setSelectedStrategy(strategy.name)}
-                >
-                  <td className="px-6 py-4 whitespace-nowrap">
-                    <div className="flex items-center gap-2">
-                      <div className="text-sm font-medium text-gray-900 dark:text-gray-100">
-                        {strategy.name}
-                      </div>
-                      {renderStars(strategy.stars)}
-                    </div>
-                  </td>
-                  <td className="px-6 py-4 whitespace-nowrap">
-                    <span className="inline-flex px-2 py-1 text-xs font-medium border border-blue-300 dark:border-blue-600 rounded text-blue-700 dark:text-blue-300">
-                      {strategy.category}
-                    </span>
-                  </td>
-                  <td className="px-6 py-4 whitespace-nowrap text-center">
-                    <span className="text-sm font-bold text-green-600 dark:text-green-400">
-                      <div className="flex items-center justify-center gap-1">
-                        <TrendingUp className="w-4 h-4" />
-                        +{strategy.fairnessImprovement}%
-                      </div>
-                    </span>
-                  </td>
-                  <td className="px-6 py-4 whitespace-nowrap text-center">
-                    <span className={`text-sm font-bold ${getImpactColor(strategy.accuracyImpact)}`}>
-                      <div className="flex items-center justify-center gap-1">
-                        <TrendingDown className="w-4 h-4" />
-                        {strategy.accuracyImpact}%
-                      </div>
-                    </span>
-                  </td>
-                  <td className="px-6 py-4 whitespace-nowrap text-center">
-                    <span className={`text-sm font-bold ${getImpactColor(strategy.precisionImpact)}`}>
-                      <div className="flex items-center justify-center gap-1">
-                        <TrendingDown className="w-4 h-4" />
-                        {strategy.precisionImpact}%
-                      </div>
-                    </span>
-                  </td>
-                  <td className="px-6 py-4 whitespace-nowrap text-center">
-                    <span className={`text-sm font-bold ${getImpactColor(strategy.f1Impact)}`}>
-                      <div className="flex items-center justify-center gap-1">
-                        <TrendingDown className="w-4 h-4" />
-                        {strategy.f1Impact}%
-                      </div>
-                    </span>
-                  </td>
-                  <td className="px-6 py-4 whitespace-nowrap text-center">
-                    <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${getRecommendationColor(strategy.recommendation)}`}>
-                      {strategy.recommendation}
-                    </span>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      </div>
+      {/* ADD THIS: Auto Pipeline Search Component */}
+      <AutoPipelineSearch 
+        analysisId={analysisId}
+        onPipelineFound={(bestPipeline, pipelineResults) => {
+          console.log('Best pipeline found:', bestPipeline);
+          console.log('Pipeline results:', pipelineResults);
+          
+          // Update the pipeline strategy state with the found best pipeline
+          setPipelineStrategy({
+            preprocessing: bestPipeline.preprocessing || '',
+            inprocessing: bestPipeline.inprocessing || '',
+            postprocessing: bestPipeline.postprocessing || ''
+          });
+          
+          // Set the pipeline results if available
+          if (pipelineResults) {
+            setPipelineResults(pipelineResults);
+            setShowRealResults(true);
+          }
+        }}
+      />
 
-      {/* Best Performers by Category */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-6">
-        {Object.entries(bestStrategies)
-          .filter(([category, strategy]) => strategy !== null) // Filter out null strategies
-          .map(([category, strategy]) => (
-          <div key={category} className="bg-white dark:bg-gray-800 rounded-lg shadow-md p-6">
-            <h3 className="text-lg font-semibold text-blue-600 dark:text-blue-400 mb-2">
-              Best {category}
-            </h3>
-            <h4 className="text-xl font-bold text-gray-900 dark:text-white mb-2">
-              {strategy.name}
-            </h4>
-            <div className="flex items-center gap-2 mb-3">
-              {renderStars(strategy.stars)}
-              <span className="text-sm text-gray-600 dark:text-gray-400">
-                {strategy.recommendation}
-              </span>
-            </div>
-            <div className="text-sm font-bold text-green-600 dark:text-green-400">
-              +{strategy.fairnessImprovement}% Fairness Improvement
-            </div>
-            <div className="text-sm text-gray-600 dark:text-gray-400">
-              {strategy.accuracyImpact}% Accuracy Impact
+      {/* Pipeline Strategy Selection */}
+      {/* Pipeline Strategy Selection */}
+      <div className="mb-8">
+        <h3 className="text-lg font-bold text-gray-900 dark:text-white mb-2">
+          Or Select Pipeline Manually
+        </h3>
+        <p className="text-sm text-gray-600 dark:text-gray-400 mb-4">
+          Alternatively, manually select strategies from each category
+        </p>
+        
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-6 p-6 bg-white dark:bg-gray-800 rounded-lg shadow-sm border border-gray-200 dark:border-gray-700">
+          {/* Preprocessing Selection */}
+          <div>
+            <label htmlFor="preprocessing-select" className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
+              Preprocessing
+              <span className="text-xs text-gray-500 dark:text-gray-400 ml-2">(Optional)</span>
+            </label>
+            <select
+              id="preprocessing-select"
+              value={pipelineStrategy.preprocessing}
+              onChange={(e) => setPipelineStrategy({...pipelineStrategy, preprocessing: e.target.value})}
+              className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+            >
+              <option value="">-- None --</option>
+              {getCategoryStrategies('Preprocessing').map(strategy => (
+                <option key={strategy.name} value={strategy.name}>
+                  {strategy.name} {strategy.stars ? `(${strategy.stars}★)` : ''}
+                </option>
+              ))}
+            </select>
+            {pipelineStrategy.preprocessing && (
+              <div className="mt-2 flex items-center gap-1 text-xs text-green-600 dark:text-green-400">
+                <CheckCircle className="w-3 h-3" />
+                <span>Selected</span>
+              </div>
+            )}
+          </div>
+
+          {/* In-processing Selection */}
+          <div>
+            <label htmlFor="inprocessing-select" className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
+              In-processing
+              <span className="text-xs text-gray-500 dark:text-gray-400 ml-2">(Optional)</span>
+            </label>
+            <select
+              id="inprocessing-select"
+              value={pipelineStrategy.inprocessing}
+              onChange={(e) => setPipelineStrategy({...pipelineStrategy, inprocessing: e.target.value})}
+              className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+            >
+              <option value="">-- None --</option>
+              {getCategoryStrategies('In-processing').map(strategy => (
+                <option key={strategy.name} value={strategy.name}>
+                  {strategy.name} {strategy.stars ? `(${strategy.stars}★)` : ''}
+                </option>
+              ))}
+            </select>
+            {pipelineStrategy.inprocessing && (
+              <div className="mt-2 flex items-center gap-1 text-xs text-green-600 dark:text-green-400">
+                <CheckCircle className="w-3 h-3" />
+                <span>Selected</span>
+              </div>
+            )}
+          </div>
+
+          {/* Post-processing Selection */}
+          <div>
+            <label htmlFor="postprocessing-select" className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
+              Post-processing
+              <span className="text-xs text-gray-500 dark:text-gray-400 ml-2">(Optional)</span>
+            </label>
+            <select
+              id="postprocessing-select"
+              value={pipelineStrategy.postprocessing}
+              onChange={(e) => setPipelineStrategy({...pipelineStrategy, postprocessing: e.target.value})}
+              className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+            >
+              <option value="">-- None --</option>
+              {getCategoryStrategies('Post-processing').map(strategy => (
+                <option key={strategy.name} value={strategy.name}>
+                  {strategy.name} {strategy.stars ? `(${strategy.stars}★)` : ''}
+                </option>
+              ))}
+            </select>
+            {pipelineStrategy.postprocessing && (
+              <div className="mt-2 flex items-center gap-1 text-xs text-green-600 dark:text-green-400">
+                <CheckCircle className="w-3 h-3" />
+                <span>Selected</span>
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Pipeline Flow Visualization */}
+        {(pipelineStrategy.preprocessing || pipelineStrategy.inprocessing || pipelineStrategy.postprocessing) && (
+          <div className="mt-4 p-4 bg-blue-50 dark:bg-blue-900/20 rounded-lg">
+            <p className="text-sm font-medium text-blue-900 dark:text-blue-100 mb-2">Selected Pipeline:</p>
+            <div className="flex items-center gap-2 flex-wrap">
+              {pipelineStrategy.preprocessing && (
+                <>
+                  <span className="px-3 py-1 bg-blue-100 dark:bg-blue-800 text-blue-800 dark:text-blue-100 rounded-full text-xs font-medium">
+                    {pipelineStrategy.preprocessing}
+                  </span>
+                  {(pipelineStrategy.inprocessing || pipelineStrategy.postprocessing) && (
+                    <span className="text-blue-600 dark:text-blue-400">→</span>
+                  )}
+                </>
+              )}
+              {pipelineStrategy.inprocessing && (
+                <>
+                  <span className="px-3 py-1 bg-purple-100 dark:bg-purple-800 text-purple-800 dark:text-purple-100 rounded-full text-xs font-medium">
+                    {pipelineStrategy.inprocessing}
+                  </span>
+                  {pipelineStrategy.postprocessing && (
+                    <span className="text-purple-600 dark:text-purple-400">→</span>
+                  )}
+                </>
+              )}
+              {pipelineStrategy.postprocessing && (
+                <span className="px-3 py-1 bg-green-100 dark:bg-green-800 text-green-800 dark:text-green-100 rounded-full text-xs font-medium">
+                  {pipelineStrategy.postprocessing}
+                </span>
+              )}
             </div>
           </div>
-        ))}
+        )}
+
+        {/* Apply Pipeline Button */}
+        <div className="mt-6 flex justify-center">
+          <button
+            onClick={handleApplyPipeline}
+            disabled={loadingPipeline || (!pipelineStrategy.preprocessing && !pipelineStrategy.inprocessing && !pipelineStrategy.postprocessing)}
+            className={`flex items-center gap-2 px-8 py-3 rounded-lg font-medium transition-colors ${
+              loadingPipeline
+                ? 'bg-gray-400 text-white cursor-not-allowed'
+                : (!pipelineStrategy.preprocessing && !pipelineStrategy.inprocessing && !pipelineStrategy.postprocessing)
+                ? 'bg-gray-300 dark:bg-gray-600 text-gray-500 dark:text-gray-400 cursor-not-allowed'
+                : 'bg-blue-600 hover:bg-blue-700 text-white shadow-lg hover:shadow-xl'
+            }`}
+          >
+            {loadingPipeline ? (
+              <>
+                <Clock className="w-5 h-5 animate-spin" />
+                Applying Pipeline...
+              </>
+            ) : (
+              <>
+                <Play className="w-5 h-5" />
+                Apply Mitigation Pipeline
+              </>
+            )}
+          </button>
+        </div>
+
+        {/* Pipeline Error Display */}
+        {pipelineError && (
+          <div className="mt-4 bg-red-50 dark:bg-red-900/20 rounded-lg p-4">
+            <div className="flex items-center gap-2 text-red-600 dark:text-red-400">
+              <AlertCircle className="w-5 h-5" />
+              <span className="font-medium">Pipeline Error:</span>
+            </div>
+            <p className="text-red-700 dark:text-red-300 mt-1 text-sm">{pipelineError}</p>
+          </div>
+        )}
+
+        {/* Pipeline Results Display */}
+        {pipelineResults && (
+          <div className="mt-6 bg-green-50 dark:bg-green-900/20 rounded-lg p-6">
+            <div className="flex items-center gap-2 text-green-600 dark:text-green-400 mb-4">
+              <CheckCircle className="w-6 h-6" />
+              <h4 className="text-lg font-bold">Pipeline Applied Successfully!</h4>
+            </div>
+            
+            {/* Pipeline Summary */}
+            <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-4">
+              <div className="bg-white dark:bg-gray-800 rounded-lg p-4">
+                <p className="text-xs text-gray-600 dark:text-gray-400 mb-1">Baseline Fairness</p>
+                <p className="text-2xl font-bold text-gray-900 dark:text-white">
+                  {pipelineResults.summary.baseline_fairness.toFixed(1)}
+                </p>
+              </div>
+              <div className="bg-white dark:bg-gray-800 rounded-lg p-4">
+                <p className="text-xs text-gray-600 dark:text-gray-400 mb-1">Final Fairness</p>
+                <p className="text-2xl font-bold text-green-600 dark:text-green-400">
+                  {pipelineResults.summary.final_fairness.toFixed(1)}
+                </p>
+              </div>
+              <div className="bg-white dark:bg-gray-800 rounded-lg p-4">
+                <p className="text-xs text-gray-600 dark:text-gray-400 mb-1">Improvement</p>
+                <p className="text-2xl font-bold text-blue-600 dark:text-blue-400">
+                  +{pipelineResults.summary.fairness_improvement.toFixed(1)}
+                </p>
+              </div>
+              <div className="bg-white dark:bg-gray-800 rounded-lg p-4">
+                <p className="text-xs text-gray-600 dark:text-gray-400 mb-1">Stages Applied</p>
+                <p className="text-2xl font-bold text-purple-600 dark:text-purple-400">
+                  {pipelineResults.summary.successful_stages}/{pipelineResults.summary.total_stages}
+                </p>
+              </div>
+            </div>
+
+            {/* Stage-by-Stage Results */}
+            <div className="bg-white dark:bg-gray-800 rounded-lg p-4">
+              <h5 className="text-sm font-bold text-gray-900 dark:text-white mb-3">Pipeline Stages:</h5>
+              <div className="space-y-2">
+                {pipelineResults.stages.map((stage, index) => (
+                  <div key={index} className="flex items-center justify-between p-3 bg-gray-50 dark:bg-gray-700 rounded">
+                    <div className="flex items-center gap-3">
+                      <span className="flex items-center justify-center w-6 h-6 rounded-full bg-blue-100 dark:bg-blue-900 text-blue-600 dark:text-blue-300 text-xs font-bold">
+                        {index + 1}
+                      </span>
+                      <div>
+                        <span className="text-sm font-medium text-gray-900 dark:text-white block">
+                          {stage.strategy}
+                        </span>
+                        <span className="text-xs text-gray-500 dark:text-gray-400">
+                          {stage.stage.replace('_', ' ').replace(/\b\w/g, l => l.toUpperCase())}
+                        </span>
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      {stage.status === 'completed' ? (
+                        <>
+                          <CheckCircle className="w-4 h-4 text-green-600 dark:text-green-400" />
+                          <span className="text-sm font-medium text-green-600 dark:text-green-400">
+                            {stage.fairness_score?.toFixed(1)}
+                          </span>
+                        </>
+                      ) : (
+                        <>
+                          <AlertCircle className="w-4 h-4 text-red-600 dark:text-red-400" />
+                          <span className="text-sm text-red-600 dark:text-red-400">Failed</span>
+                        </>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* Performance Metrics */}
+            {pipelineResults.improvements && (
+              <div className="mt-4 bg-white dark:bg-gray-800 rounded-lg p-4">
+                <h5 className="text-sm font-bold text-gray-900 dark:text-white mb-3">Performance Impact:</h5>
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                  <div>
+                    <p className="text-xs text-gray-600 dark:text-gray-400">Accuracy</p>
+                    <p className={`text-lg font-bold ${pipelineResults.improvements.accuracy >= 0 ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'}`}>
+                      {pipelineResults.improvements.accuracy >= 0 ? '+' : ''}{pipelineResults.improvements.accuracy.toFixed(2)}%
+                    </p>
+                  </div>
+                  <div>
+                    <p className="text-xs text-gray-600 dark:text-gray-400">Precision</p>
+                    <p className={`text-lg font-bold ${pipelineResults.improvements.precision >= 0 ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'}`}>
+                      {pipelineResults.improvements.precision >= 0 ? '+' : ''}{pipelineResults.improvements.precision.toFixed(2)}%
+                    </p>
+                  </div>
+                  <div>
+                    <p className="text-xs text-gray-600 dark:text-gray-400">Recall</p>
+                    <p className={`text-lg font-bold ${pipelineResults.improvements.recall >= 0 ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'}`}>
+                      {pipelineResults.improvements.recall >= 0 ? '+' : ''}{pipelineResults.improvements.recall.toFixed(2)}%
+                    </p>
+                  </div>
+                  <div>
+                    <p className="text-xs text-gray-600 dark:text-gray-400">F1 Score</p>
+                    <p className={`text-lg font-bold ${pipelineResults.improvements.f1 >= 0 ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'}`}>
+                      {pipelineResults.improvements.f1 >= 0 ? '+' : ''}{pipelineResults.improvements.f1.toFixed(2)}%
+                    </p>
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
       </div>
 
       {/* Before/After Model Comparison Visualizations */}
       <div className="bg-white dark:bg-gray-800 rounded-lg shadow-md p-6">
         <h3 className="text-lg font-bold text-gray-900 dark:text-white mb-4">
-          {showRealResults ? `Real Results: ${selectedStrategy}` : `Strategy Analysis: ${selectedStrategy}`}
-          {showRealResults && (
-            <span className="ml-2 inline-flex items-center gap-1 text-green-600 dark:text-green-400 text-sm">
-              <CheckCircle className="w-4 h-4" />
-              Real
-            </span>
+          {pipelineResults ? (
+            <>
+              Pipeline Results: {[
+                pipelineStrategy.preprocessing,
+                pipelineStrategy.inprocessing,
+                pipelineStrategy.postprocessing
+              ].filter(Boolean).join(' → ')}
+              <span className="ml-2 inline-flex items-center gap-1 text-green-600 dark:text-green-400 text-sm">
+                <CheckCircle className="w-4 h-4" />
+                Pipeline Applied
+              </span>
+            </>
+          ) : showRealResults ? (
+            <>
+              Real Results: {selectedStrategy}
+              <span className="ml-2 inline-flex items-center gap-1 text-green-600 dark:text-green-400 text-sm">
+                <CheckCircle className="w-4 h-4" />
+                Real
+              </span>
+            </>
+          ) : (
+            `Strategy Analysis: ${selectedStrategy}`
           )}
         </h3>
         
@@ -585,7 +885,48 @@ const MitigationStrategyAnalysis = ({ data, analysisId }) => {
 
         {selectedTab === 0 && (
           <div>
-            {comparisonError ? (
+            {pipelineResults ? (
+              // Show pipeline results in overview
+              <div>
+                <div className="mb-4 bg-blue-50 dark:bg-blue-900/20 rounded-lg p-3">
+                  <p className="text-sm text-blue-900 dark:text-blue-100">
+                    <strong>Pipeline Applied:</strong>{' '}
+                    {[
+                      pipelineStrategy.preprocessing,
+                      pipelineStrategy.inprocessing,
+                      pipelineStrategy.postprocessing
+                    ].filter(Boolean).join(' → ')}
+                  </p>
+                </div>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                  <div className="bg-gray-50 dark:bg-gray-700 rounded-lg p-4">
+                    <h4 className="text-sm font-bold text-gray-900 dark:text-white mb-2">
+                      Baseline Model
+                    </h4>
+                    <div className={`text-3xl font-bold ${getFairnessScoreColor(Math.round(pipelineResults.summary.baseline_fairness))}`}>
+                      {Math.round(pipelineResults.summary.baseline_fairness)}/100
+                    </div>
+                    <div className="text-sm text-gray-600 dark:text-gray-400">
+                      {getFairnessScoreLabel(Math.round(pipelineResults.summary.baseline_fairness))}
+                    </div>
+                  </div>
+                  <div className="bg-green-50 dark:bg-green-900/20 rounded-lg p-4">
+                    <h4 className="text-sm font-bold text-gray-900 dark:text-white mb-2">
+                      After Pipeline
+                    </h4>
+                    <div className={`text-3xl font-bold ${getFairnessScoreColor(Math.round(pipelineResults.summary.final_fairness))}`}>
+                      {Math.round(pipelineResults.summary.final_fairness)}/100
+                    </div>
+                    <div className="text-sm text-gray-600 dark:text-gray-400">
+                      {getFairnessScoreLabel(Math.round(pipelineResults.summary.final_fairness))}
+                    </div>
+                    <div className="mt-2 text-lg font-bold text-green-600 dark:text-green-400">
+                      +{pipelineResults.summary.fairness_improvement.toFixed(1)} improvement
+                    </div>
+                  </div>
+                </div>
+              </div>
+            ) : comparisonError ? (
               <div className="bg-red-50 dark:bg-red-900/20 rounded-lg p-6 text-center">
                 <h3 className="text-lg font-bold text-red-600 dark:text-red-400 mb-2">
                   Error Loading Comparison Data
@@ -655,7 +996,64 @@ const MitigationStrategyAnalysis = ({ data, analysisId }) => {
 
         {selectedTab === 1 && (
           <div>
-            {!visualizationData ? (
+            {pipelineResults ? (
+              // Show pipeline fairness metrics if available
+              <>
+                <div className="flex items-center justify-between mb-6">
+                  <p className="text-gray-700 dark:text-gray-300">
+                    Pipeline fairness improvement across {pipelineResults.summary.total_stages} stage(s):
+                  </p>
+                  <div className="flex items-center gap-2 text-green-600 dark:text-green-400 text-sm">
+                    <CheckCircle className="w-4 h-4" />
+                    <span className="font-medium">Pipeline Results</span>
+                  </div>
+                </div>
+                
+                {/* Display stage-by-stage fairness progression */}
+                <div className="bg-white dark:bg-gray-800 rounded-lg shadow-md p-4 mb-4">
+                  <h4 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">
+                    Fairness Progression Through Pipeline
+                  </h4>
+                  <div className="space-y-3">
+                    <div className="flex items-center justify-between p-3 bg-gray-50 dark:bg-gray-700 rounded">
+                      <span className="text-sm font-medium text-gray-900 dark:text-white">
+                        Baseline
+                      </span>
+                      <span className="text-lg font-bold text-gray-600 dark:text-gray-300">
+                        {pipelineResults.summary.baseline_fairness.toFixed(1)}
+                      </span>
+                    </div>
+                    {pipelineResults.stages.map((stage, index) => (
+                      <div key={index} className="flex items-center justify-between p-3 bg-blue-50 dark:bg-blue-900/20 rounded">
+                        <div>
+                          <span className="text-sm font-medium text-gray-900 dark:text-white block">
+                            Stage {index + 1}: {stage.strategy}
+                          </span>
+                          <span className="text-xs text-gray-500 dark:text-gray-400">
+                            {stage.stage.replace('_', ' ')}
+                          </span>
+                        </div>
+                        {stage.status === 'completed' ? (
+                          <span className="text-lg font-bold text-green-600 dark:text-green-400">
+                            {stage.fairness_score?.toFixed(1)}
+                          </span>
+                        ) : (
+                          <span className="text-sm text-red-600 dark:text-red-400">Failed</span>
+                        )}
+                      </div>
+                    ))}
+                    <div className="flex items-center justify-between p-3 bg-green-50 dark:bg-green-900/20 rounded border-2 border-green-500">
+                      <span className="text-sm font-bold text-gray-900 dark:text-white">
+                        Final Result
+                      </span>
+                      <span className="text-xl font-bold text-green-600 dark:text-green-400">
+                        {pipelineResults.summary.final_fairness.toFixed(1)}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+              </>
+            ) : !visualizationData ? (
               <div className="bg-yellow-50 dark:bg-yellow-900/20 rounded-lg p-6 text-center">
                 <h3 className="text-lg font-bold text-yellow-600 dark:text-yellow-400 mb-2">
                   No Fairness Metrics Data Available

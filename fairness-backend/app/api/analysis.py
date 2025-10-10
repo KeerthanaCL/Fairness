@@ -7,6 +7,22 @@ from fastapi import APIRouter, HTTPException, BackgroundTasks, Query
 from typing import Optional, Dict, Any
 import logging
 import uuid
+from pydantic import BaseModel
+router = APIRouter()
+
+# # Include the analysis router
+# app.include_router(analysis.router, prefix="/api/analysis", tags=["analysis"])
+# Add this request model at the top with other imports
+class PipelineMitigationRequest(BaseModel):
+    analysisId: str
+    preprocessingStrategy: Optional[str] = None
+    inprocessingStrategy: Optional[str] = None
+    postprocessingStrategy: Optional[str] = None
+
+class AutoPipelineSearchRequest(BaseModel):
+    analysisId: str
+    searchMethod: str  # "greedy", "topk", or "exhaustive"
+    k: Optional[int] = 2  # for topk method
 
 from app.models.schemas import (
     AnalysisStartRequest, AnalysisStartResponse, AnalysisStatusResponse,
@@ -408,7 +424,7 @@ async def apply_real_mitigation(
         sensitive_attrs = request.sensitive_attributes or detected_attrs
         
         if not sensitive_attrs:
-            raise HTTPException(status_code=400, detail="No sensitive attributes found")
+            raise HTTPException(status_code=400, detail="No sensitive attributes detected or provided. Please rerun detection.")
         
         # Initialize mitigation service
         mitigation_service = MitigationService()
@@ -489,3 +505,412 @@ async def apply_real_mitigation(
     except Exception as e:
         logger.error(f"Real mitigation failed: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Mitigation failed: {str(e)}")
+
+@router.post("/apply-mitigation-pipeline")
+async def apply_mitigation_pipeline(request: PipelineMitigationRequest):
+    """
+    Apply mitigation strategies as a sequential pipeline.
+    User can select one strategy from each category:
+    - Preprocessing (optional)
+    - In-processing (optional) 
+    - Post-processing (optional)
+    
+    Strategies are applied sequentially, with each stage using the output of the previous stage.
+    
+    Expected frontend call: POST /api/analysis/apply-mitigation-pipeline
+    Body: {
+        "analysisId": "...",
+        "preprocessingStrategy": "Reweighing" (optional),
+        "inprocessingStrategy": "Prejudice Remover" (optional),
+        "postprocessingStrategy": "Reject Option Classifier" (optional)
+    }
+    """
+    try:
+        logger.info(f"Applying mitigation pipeline for analysis {request.analysisId}")
+        logger.info(f"Pre: {request.preprocessingStrategy}, In: {request.inprocessingStrategy}, Post: {request.postprocessingStrategy}")
+        
+        # Get analysis
+        analysis = analysis_service.analyses.get(request.analysisId)
+        if not analysis:
+            raise HTTPException(status_code=404, detail="Analysis not found")
+        
+        if analysis["status"] != AnalysisStatus.COMPLETED:
+            raise HTTPException(status_code=400, detail="Analysis must be completed first")
+        
+        # Validate at least one strategy is selected
+        if not any([request.preprocessingStrategy, request.inprocessingStrategy, request.postprocessingStrategy]):
+            raise HTTPException(status_code=400, detail="At least one mitigation strategy must be selected")
+        
+        # Get required data from analysis
+        analysis_request = analysis["request"]
+        
+        # Import necessary modules
+        from app.api.upload import get_upload_file_path
+        from pathlib import Path
+        from app.services.mitigation_service import MitigationService
+        from app.utils.file_handler import FileHandler
+        
+        # Get file paths
+        training_path_str = get_upload_file_path(analysis_request.training_dataset_id)
+        model_path_str = get_upload_file_path(analysis_request.model_id)
+        testing_path_str = get_upload_file_path(analysis_request.testing_dataset_id) if analysis_request.testing_dataset_id else None
+        
+        if not training_path_str or not model_path_str:
+            raise HTTPException(status_code=400, detail="Required files not found")
+        
+        # Load data and model
+        file_handler = FileHandler()
+        train_df = file_handler.load_dataset(Path(training_path_str))
+        model = file_handler.load_model(Path(model_path_str))
+        test_df = file_handler.load_dataset(Path(testing_path_str)) if testing_path_str else train_df
+        
+        # Get sensitive attributes
+        sensitive_features = analysis["results"].get("sensitive_features", {})
+        detected_attrs = [sf["name"] for sf in sensitive_features.get("detectedFeatures", [])]
+        sensitive_attrs = analysis_request.sensitive_attributes or detected_attrs
+        
+        if not sensitive_attrs:
+            raise HTTPException(status_code=400, detail="No sensitive attributes found")
+        
+        # Initialize mitigation service and apply pipeline
+        mitigation_service = MitigationService()
+        
+        logger.info("Starting mitigation pipeline processing")
+        pipeline_results = mitigation_service.apply_mitigation_pipeline(
+            preprocessing_strategy=request.preprocessingStrategy,
+            inprocessing_strategy=request.inprocessingStrategy,
+            postprocessing_strategy=request.postprocessingStrategy,
+            model=model,
+            train_df=train_df,
+            test_df=test_df,
+            target_column=analysis_request.target_column,
+            sensitive_attributes=sensitive_attrs
+        )
+        
+        logger.info(f"Pipeline completed successfully. Fairness improvement: {pipeline_results['summary']['fairness_improvement']:.2f}")
+        
+        # Format response
+        from app.models.schemas import PerformanceMetrics
+        
+        response = {
+            "status": "success",
+            "pipeline": {
+                "summary": pipeline_results["summary"],
+                "stages": [
+                    {
+                        "stage": stage["stage"],
+                        "strategy": stage["strategy"],
+                        "status": stage["status"],
+                        "fairness_score": stage.get("metrics", {}).get("fairness_score", 0) if stage["status"] == "completed" else None,
+                        "error": stage.get("error")
+                    }
+                    for stage in pipeline_results["stages"]
+                ],
+                "baseline": {
+                    "fairness_score": pipeline_results["baseline"]["fairness_score"],
+                    "performance": PerformanceMetrics(
+                        accuracy=pipeline_results["baseline"]["performance"]["accuracy"] * 100,
+                        precision=pipeline_results["baseline"]["performance"]["precision"] * 100,
+                        recall=pipeline_results["baseline"]["performance"]["recall"] * 100,
+                        f1=pipeline_results["baseline"]["performance"]["f1"] * 100
+                    ).dict()
+                },
+                "final": {
+                    "fairness_score": pipeline_results["final"]["fairness_score"],
+                    "performance": PerformanceMetrics(
+                        accuracy=pipeline_results["final"]["performance"]["accuracy"] * 100,
+                        precision=pipeline_results["final"]["performance"]["precision"] * 100,
+                        recall=pipeline_results["final"]["performance"]["recall"] * 100,
+                        f1=pipeline_results["final"]["performance"]["f1"] * 100
+                    ).dict()
+                },
+                "improvements": {
+                    "fairness": pipeline_results["improvements"].get("fairness_improvement", 0),
+                    "accuracy": pipeline_results["improvements"].get("accuracy_change", 0) * 100,
+                    "precision": pipeline_results["improvements"].get("precision_change", 0) * 100,
+                    "recall": pipeline_results["improvements"].get("recall_change", 0) * 100,
+                    "f1": pipeline_results["improvements"].get("f1_change", 0) * 100
+                }
+            }
+        }
+        
+        return response
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Pipeline mitigation failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Pipeline mitigation failed: {str(e)}")
+    
+@router.post("/find-best-pipeline")
+async def find_best_pipeline(request: AutoPipelineSearchRequest):
+    """
+    Automatically find the best mitigation pipeline using different search strategies
+    
+    Search Methods:
+    - "greedy": Fast, tests ~13 strategies sequentially (5-10 min)
+    - "topk": Tests top-k combinations from each category (10-20 min for k=2)
+    - "exhaustive": Tests ALL combinations - slow but finds optimal (1-2 hours)
+    
+    Expected frontend call: POST /api/analysis/find-best-pipeline
+    """
+    try:
+        logger.info(f"=== Auto Pipeline Search Request ===")
+        logger.info(f"Analysis ID: {request.analysisId}")
+        logger.info(f"Search Method: {request.searchMethod}")
+        if request.searchMethod == "topk":
+            logger.info(f"K value: {request.k}")
+        
+        # Get analysis
+        analysis = analysis_service.analyses.get(request.analysisId)
+        if not analysis:
+            raise HTTPException(status_code=404, detail="Analysis not found")
+        
+        if analysis["status"] != AnalysisStatus.COMPLETED:
+            raise HTTPException(status_code=400, detail="Analysis must be completed first")
+        
+        # Get required data from analysis
+        analysis_request = analysis["request"]
+        
+        # Import necessary modules
+        from app.api.upload import get_upload_file_path
+        from pathlib import Path
+        from app.services.mitigation_service import MitigationService
+        from app.utils.file_handler import FileHandler
+        
+        # Get file paths
+        training_path_str = get_upload_file_path(analysis_request.training_dataset_id)
+        model_path_str = get_upload_file_path(analysis_request.model_id)
+        testing_path_str = get_upload_file_path(analysis_request.testing_dataset_id) if analysis_request.testing_dataset_id else None
+        
+        if not training_path_str or not model_path_str:
+            raise HTTPException(status_code=400, detail="Required files not found")
+        
+        # Load data and model
+        file_handler = FileHandler()
+        train_df = file_handler.load_dataset(Path(training_path_str))
+        model = file_handler.load_model(Path(model_path_str))
+        test_df = file_handler.load_dataset(Path(testing_path_str)) if testing_path_str else train_df
+        
+        # Get sensitive attributes
+        sensitive_features = analysis["results"].get("sensitive_features", {})
+        detected_attrs = [sf["name"] for sf in sensitive_features.get("detectedFeatures", [])]
+        sensitive_attrs = analysis_request.sensitive_attributes or detected_attrs
+        
+        if not sensitive_attrs:
+            raise HTTPException(status_code=400, detail="No sensitive attributes found")
+        
+        # Initialize mitigation service
+        mitigation_service = MitigationService()
+        
+        # Choose search method
+        logger.info(f"Starting {request.searchMethod} search...")
+        
+        if request.searchMethod == "greedy":
+            result = mitigation_service.find_best_pipeline_greedy(
+                model=model,
+                train_df=train_df,
+                test_df=test_df,
+                target_column=analysis_request.target_column,
+                sensitive_attributes=sensitive_attrs
+            )
+        elif request.searchMethod == "topk":
+            result = mitigation_service.find_best_pipeline_topk(
+                model=model,
+                train_df=train_df,
+                test_df=test_df,
+                target_column=analysis_request.target_column,
+                sensitive_attributes=sensitive_attrs,
+                k=request.k
+            )
+        elif request.searchMethod == "exhaustive":
+            result = mitigation_service.find_best_pipeline_exhaustive(
+                model=model,
+                train_df=train_df,
+                test_df=test_df,
+                target_column=analysis_request.target_column,
+                sensitive_attributes=sensitive_attrs
+            )
+        else:
+            raise HTTPException(status_code=400, detail=f"Invalid search method: {request.searchMethod}")
+        
+        logger.info(f"Search completed successfully!")
+        logger.info(f"Best pipeline: {result['best_pipeline']}")
+        
+        return {
+            "status": "success",
+            "searchMethod": request.searchMethod,
+            "bestPipeline": result['best_pipeline'],
+            "finalScore": result.get('final_score'),
+            "improvement": result.get('improvement'),
+            "strategiesTested": result.get('strategies_tested') or result.get('combinations_tested'),
+            "pipelineResults": result.get('results')
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Auto pipeline search failed: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Pipeline search failed: {str(e)}")
+
+@router.get("/config/sensitive-attributes")
+async def get_sensitive_attributes():
+    """
+    Get available sensitive attributes for configuration
+    This endpoint is used by frontend to populate dropdown during setup
+    """
+    try:
+        # List of common sensitive attributes
+        sensitive_attributes = [
+            {
+                "name": "gender",
+                "label": "Gender",
+                "dataType": "categorical",
+                "description": "Gender identity (e.g., Male, Female, Non-binary)"
+            },
+            {
+                "name": "race",
+                "label": "Race/Ethnicity",
+                "dataType": "categorical",
+                "description": "Race or ethnic background"
+            },
+            {
+                "name": "age",
+                "label": "Age",
+                "dataType": "numerical",
+                "description": "Age in years"
+            },
+            {
+                "name": "age_group",
+                "label": "Age Group",
+                "dataType": "categorical",
+                "description": "Age categorized into groups"
+            },
+            {
+                "name": "disability",
+                "label": "Disability Status",
+                "dataType": "categorical",
+                "description": "Whether person has disability"
+            },
+            {
+                "name": "marital_status",
+                "label": "Marital Status",
+                "dataType": "categorical",
+                "description": "Marital status (e.g., Single, Married, Divorced)"
+            },
+            {
+                "name": "education",
+                "label": "Education Level",
+                "dataType": "categorical",
+                "description": "Level of education completed"
+            },
+            {
+                "name": "income",
+                "label": "Income Level",
+                "dataType": "categorical",
+                "description": "Income bracket or range"
+            },
+            {
+                "name": "employment",
+                "label": "Employment Status",
+                "dataType": "categorical",
+                "description": "Employment status (e.g., Employed, Unemployed)"
+            },
+            {
+                "name": "veteran_status",
+                "label": "Veteran Status",
+                "dataType": "categorical",
+                "description": "Military service status"
+            },
+            {
+                "name": "religion",
+                "label": "Religion",
+                "dataType": "categorical",
+                "description": "Religious belief or affiliation"
+            },
+            {
+                "name": "national_origin",
+                "label": "National Origin",
+                "dataType": "categorical",
+                "description": "Country of origin or nationality"
+            }
+        ]
+        
+        logger.info(f"Returning {len(sensitive_attributes)} sensitive attributes")
+        
+        return {
+            "attributes": sensitive_attributes
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to get sensitive attributes: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to get attributes: {str(e)}")
+
+
+@router.get("/config/mitigation-options")
+async def get_mitigation_options():
+    """
+    Get available mitigation options
+    This endpoint is used by frontend to populate strategy selection
+    """
+    try:
+        mitigation_options = [
+            {
+                "name": "Reweighing",
+                "label": "Reweighing",
+                "category": "Preprocessing",
+                "description": "Adjusts instance weights to reduce bias in training data"
+            },
+            {
+                "name": "Disparate Impact Remover",
+                "label": "Disparate Impact Remover",
+                "category": "Preprocessing",
+                "description": "Removes features that cause disparate impact"
+            },
+            {
+                "name": "Data Augmentation",
+                "label": "Data Augmentation",
+                "category": "Preprocessing",
+                "description": "Augments underrepresented groups with synthetic data"
+            },
+            {
+                "name": "Fairness Regularization",
+                "label": "Fairness Regularization",
+                "category": "In-processing",
+                "description": "Adds fairness penalty to model training objective"
+            },
+            {
+                "name": "Adversarial Debiasing",
+                "label": "Adversarial Debiasing",
+                "category": "In-processing",
+                "description": "Uses adversarial training to remove bias"
+            },
+            {
+                "name": "Threshold Optimization",
+                "label": "Threshold Optimization",
+                "category": "Post-processing",
+                "description": "Optimizes decision thresholds for each sensitive group"
+            },
+            {
+                "name": "Calibration Adjustment",
+                "label": "Calibration Adjustment",
+                "category": "Post-processing",
+                "description": "Calibrates predictions to ensure fairness across groups"
+            },
+            {
+                "name": "Equalized Odds Post-processing",
+                "label": "Equalized Odds Post-processing",
+                "category": "Post-processing",
+                "description": "Adjusts predictions to achieve equalized odds"
+            }
+        ]
+        
+        logger.info(f"Returning {len(mitigation_options)} mitigation options")
+        
+        return {
+            "options": mitigation_options
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to get mitigation options: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to get options: {str(e)}")

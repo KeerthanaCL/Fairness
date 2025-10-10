@@ -21,10 +21,13 @@ logger = logging.getLogger(__name__)
 class BiasDetector:
     """Enhanced bias detection with comprehensive statistical analysis"""
     
-    def __init__(self, significance_level: float = 0.05):
+    def __init__(self, significance_level: float = 0.05, use_hsic: bool = True, kernel_type: str = 'rbf'):
         self.significance_level = significance_level
         self.sensitive_features = []
         self.statistical_results = {}
+        self.use_hsic = use_hsic
+        self.kernel_type = kernel_type
+        self.epsilon = 1e-6  # Regularization parameter
         
     def detect_sensitive_features(
         self, 
@@ -34,15 +37,21 @@ class BiasDetector:
         exclude_columns: Optional[List[str]] = None
     ) -> SensitiveFeatureDetectionResponse:
         """
-        Main method to detect sensitive features using statistical tests
+        Main method to detect sensitive features using HSIC/NOCCO approach and statistical tests
         """
         exclude_columns = exclude_columns or []
         
         try:
-            # Perform statistical tests
-            statistical_results = self._perform_statistical_tests(
-                df, target_column, feature_types, exclude_columns
-            )
+            if self.use_hsic:
+                # Perform HSIC/NOCCO analysis for sensitive feature detection
+                statistical_results = self._perform_hsic_analysis(
+                    df, target_column, feature_types, exclude_columns
+                )
+            else:
+                # Fallback to traditional statistical tests
+                statistical_results = self._perform_statistical_tests(
+                    df, target_column, feature_types, exclude_columns
+                )
             
             # Convert results to Pydantic models
             detected_features = self._convert_to_response_format(statistical_results, df)
@@ -58,8 +67,227 @@ class BiasDetector:
             )
             
         except Exception as e:
-            logger.error(f"Bias detection failed: {str(e)}")
+            logger.error(f"Bias detection failed: {str(e)}", exc_info=True)
             raise
+    
+    def _perform_hsic_analysis(
+        self, 
+        df: pd.DataFrame, 
+        target_column: str, 
+        feature_types: Dict[str, str],
+        exclude_columns: List[str]
+    ) -> Dict[str, Dict[str, Any]]:
+        """
+        Perform HSIC/NOCCO analysis to detect sensitive features based on the research paper
+        """
+        results = {}
+        target_values = df[target_column].values
+
+        # Remove rows with missing target values
+        valid_target_mask = ~pd.isna(target_values)
+        
+        # Calculate NOCCO values for all features
+        nocco_values = {}
+        
+        for feature, feature_type in feature_types.items():
+            if feature == target_column or feature in exclude_columns:
+                continue
+                
+            try:
+                # Get valid indices for this feature
+                feature_series = df[feature]
+                valid_mask = valid_target_mask & ~feature_series.isnull()
+                
+                if valid_mask.sum() < 10:
+                    results[feature] = {
+                        'test_type': 'hsic_insufficient_data',
+                        'p_value': 1.0,
+                        'statistic': None,
+                        'correlation': 0.0,
+                        'is_sensitive': False
+                    }
+                    continue
+
+                # Handle feature based on its type
+                if feature_type == 'categorical':
+                    # For categorical features, perform one-hot encoding and find max NOCCO
+                    feature_result = self._analyze_categorical_feature(feature_series[valid_mask], target_values[valid_mask])
+                else:
+                    # For numerical features, calculate NOCCO directly
+                    feature_result = self._analyze_numerical_feature(feature_series[valid_mask], target_values[valid_mask])
+                
+                results[feature] = feature_result
+                nocco_values[feature] = feature_result['correlation']  # Using correlation for NOCCO value
+                        
+            except Exception as e:
+                logger.warning(f"HSIC analysis failed for feature {feature}: {str(e)}")
+                results[feature] = {
+                    'test_type': 'hsic_failed',
+                    'p_value': 1.0,
+                    'statistic': None,
+                    'correlation': 0.0,
+                    'error': str(e),
+                    'is_sensitive': False
+                }
+
+        # Calculate threshold (median of NOCCO values)
+        if nocco_values:
+            threshold = np.percentile(list(nocco_values.values()), 75)
+            logger.info(f"NOCCO threshold (median): {threshold:.4f}")
+        else:
+            threshold = 0.0
+            
+        # Mark features as sensitive based on threshold
+        for feature, result in results.items():
+            if 'is_sensitive' not in result:
+                if result['correlation'] >= threshold:
+                    if feature not in self.sensitive_features:
+                        self.sensitive_features.append(feature)
+                    result['is_sensitive'] = True
+                else:
+                    result['is_sensitive'] = False
+        
+        self.statistical_results = results
+        return results
+    
+    def _analyze_categorical_feature(self, feature_series: pd.Series, target_values: np.ndarray) -> Dict[str, Any]:
+        """
+        Analyze categorical feature using NOCCO approach (one-vs-all for each category)
+        """
+        # # Remove missing values
+        # valid_mask = ~feature_series.isnull()
+        # feature_clean = feature_series[valid_mask]
+        # target_clean = target_values[valid_mask]
+        
+        # Get unique categories
+        categories = feature_series.unique()
+
+        if len(categories) < 2:
+            return {
+                'test_type': 'hsic_insufficient_groups',
+                'p_value': 1.0,
+                'statistic': None,
+                'correlation': 0.0
+            }
+        
+        # Calculate NOCCO for each category (one-vs-all)
+        max_nocco = 0.0
+        max_category = None
+        category_noccos = {}
+        
+        for category in categories:
+            # Create binary indicator for this category
+            category_indicator = (feature_series == category).astype(float).values.reshape(-1, 1)
+            
+            # Calculate NOCCO
+            nocco_value = self._calculate_nocco(category_indicator, target_values.reshape(-1, 1))
+
+            # Store NOCCO value for each category
+            category_noccos[str(category)] = nocco_value
+            
+            if nocco_value > max_nocco:
+                max_nocco = nocco_value
+                max_category = category
+        
+        # Estimate p-value based on NOCCO value (higher NOCCO = lower p-value)
+        # This is a heuristic approximation as the paper doesn't specify how to convert NOCCO to p-value
+        p_value = np.exp(-5 * max_nocco)  # Exponential decay function
+        p_value = np.clip(p_value, 0.0, 1.0)  # Ensure p-value is in [0,1]
+        
+        return {
+            'test_type': 'hsic_nocco',
+            'p_value': p_value,
+            'statistic': max_nocco,
+            'correlation': max_nocco,
+            'sensitive_group': str(max_category),
+            'category_noccos': category_noccos
+        }
+    
+    def _analyze_numerical_feature(self, feature_series: pd.Series, target_values: np.ndarray) -> Dict[str, Any]:
+        """
+        Analyze numerical feature using NOCCO approach
+        """
+        # Remove missing values
+        feature_clean = feature_series.values.reshape(-1, 1)
+        target_clean = target_values.reshape(-1, 1)
+        
+        # Calculate NOCCO
+        nocco_value = self._calculate_nocco(feature_clean, target_clean)
+        
+        # Estimate p-value based on NOCCO value
+        p_value = np.exp(-5 * nocco_value)  # Exponential decay function
+        p_value = np.clip(p_value, 0.0, 1.0)  # Ensure p-value is in [0,1]
+        
+        return {
+            'test_type': 'hsic_nocco',
+            'p_value': p_value,
+            'statistic': nocco_value,
+            'correlation': nocco_value
+        }
+    
+    def _calculate_nocco(self, X: np.ndarray, y: np.ndarray) -> float:
+        """
+        Calculate NOrmalized Cross-Covariance Operator (NOCCO)
+        Based on the paper's algorithm
+        """
+        n = X.shape[0]
+        
+        try:
+            # Calculate kernel matrices
+            K_x = self._kernel_matrix(X)
+            K_y = self._kernel_matrix(y)
+            
+            # Centering matrix
+            H = np.eye(n) - (1.0/n) * np.ones((n, n))
+            
+            # Centered kernel matrices
+            K_x_centered = H @ K_x @ H
+            K_y_centered = H @ K_y @ H
+    
+            # Calculate R_x and R_y with regularization
+            # R_x = K_x_centered @ inv(K_x_centered + epsilon * n * I)
+            K_x_reg = K_x_centered + self.epsilon * n * np.eye(n)
+            K_y_reg = K_y_centered + self.epsilon * n * np.eye(n)
+            
+            R_x = K_x_centered @ np.linalg.inv(K_x_reg)
+            R_y = K_y_centered @ np.linalg.inv(K_y_reg)
+            
+            # Calculate NOCCO
+            nocco_value = np.trace(R_x @ R_y) / (np.sqrt(np.trace(R_x @ R_x)) * np.sqrt(np.trace(R_y @ R_y)) + self.epsilon)
+            
+            # Ensure value is between 0 and 1
+            nocco_value = np.clip(nocco_value, 0.0, 1.0)
+            
+            return float(nocco_value)
+            
+        except (np.linalg.LinAlgError, ValueError) as e:
+            logger.warning(f"Matrix inversion failed in NOCCO calculation: {str(e)}")
+            return 0.0
+    
+    def _kernel_matrix(self, X: np.ndarray) -> np.ndarray:
+        """
+        Calculate kernel matrix for a given vector or matrix X
+        """
+        n = X.shape[0]
+        
+        if self.kernel_type == 'rbf':
+            # Calculate pairwise squared Euclidean distances
+            X_squared = np.sum(X**2, axis=1).reshape(-1, 1)
+            distances = X_squared + X_squared.T - 2 * np.dot(X, X.T)
+
+            # Ensure non-negative distances (numerical stability)
+            distances = np.maximum(distances, 0)
+
+            # Apply RBF kernel with sigma = 1/n
+            sigma = np.median(distances[distances > 0])
+            K = np.exp(-distances / (2 * sigma**2 + self.epsilon))
+        elif self.kernel_type == 'linear':
+            # Linear kernel is just the dot product
+            K = np.dot(X, X.T)
+        else:
+            raise ValueError(f"Unknown kernel type: {self.kernel_type}")
+        
+        return K
     
     def _perform_statistical_tests(
         self, 
@@ -88,7 +316,10 @@ class BiasDetector:
                 if test_result['p_value'] < self.significance_level:
                     if feature not in self.sensitive_features:
                         self.sensitive_features.append(feature)
-                        
+                    test_result['is_sensitive'] = True
+                else:
+                    test_result['is_sensitive'] = False
+
             except Exception as e:
                 logger.warning(f"Statistical test failed for feature {feature}: {str(e)}")
                 results[feature] = {
@@ -96,7 +327,8 @@ class BiasDetector:
                     'p_value': 1.0,
                     'statistic': None,
                     'correlation': 0.0,
-                    'error': str(e)
+                    'error': str(e),
+                    'is_sensitive': False
                 }
         
         self.statistical_results = results
@@ -166,9 +398,9 @@ class BiasDetector:
             correlation, p_value = stats.pearsonr(feature, target)
             return {
                 'test_type': 'pearson_correlation',
-                'p_value': p_value,
-                'statistic': correlation,
-                'correlation': abs(correlation)
+                'p_value': float(p_value),
+                'statistic': float(correlation),
+                'correlation': float(abs(correlation))
             }
         except Exception as e:
             logger.warning(f"Pearson correlation test failed: {str(e)}")
@@ -216,9 +448,9 @@ class BiasDetector:
             
             return {
                 'test_type': 'anova_f_test',
-                'p_value': p_value,
-                'statistic': f_statistic,
-                'correlation': correlation
+                'p_value': float(p_value),
+                'statistic': float(f_statistic),
+                'correlation': float(correlation)
             }
             
         except Exception as e:
@@ -255,9 +487,9 @@ class BiasDetector:
             
             return {
                 'test_type': 'chi_square',
-                'p_value': p_value,
-                'statistic': chi2_stat,
-                'correlation': correlation
+                'p_value': float(p_value),
+                'statistic': float(chi2_stat),
+                'correlation': float(correlation)
             }
             
         except Exception as e:
@@ -320,8 +552,8 @@ class BiasDetector:
         
         for feature_name, result in statistical_results.items():
             try:
-                # Skip failed tests
-                if result.get('test_type') == 'failed':
+                # Skip failed tests or insufficient data
+                if result.get('test_type') in ['failed', 'hsic_insufficient_data', 'hsic_failed']:
                     continue
                 
                 # Determine data type
@@ -336,14 +568,22 @@ class BiasDetector:
                 
                 # Determine sensitivity level
                 p_value = result.get('p_value', 1.0)
-                sensitivity_level = self._classify_sensitivity(p_value, correlation)
+                is_sensitive = result.get('is_sensitive', False)
+                sensitivity_level = self._classify_sensitivity(p_value, correlation, is_sensitive)
                 
                 # Get unique groups
                 groups = self._get_feature_groups(df[feature_name])
+
+                # Add sensitive group information if available
+                sensitive_group = result.get('sensitive_group')
+                if sensitive_group is not None and str(sensitive_group) in groups:
+                    # Move sensitive group to front
+                    groups = [str(sensitive_group)] + [g for g in groups if g != str(sensitive_group)]
                 
                 # Generate description
                 description = self._generate_feature_description(
-                    feature_name, test_type, p_value, correlation, groups
+                    feature_name, test_type, p_value, correlation, groups,
+                    is_hsic=result.get('test_type', '').startswith('hsic')
                 )
                 
                 feature = SensitiveFeature(
@@ -365,8 +605,11 @@ class BiasDetector:
                 logger.warning(f"Failed to convert feature {feature_name}: {str(e)}")
                 continue
         
-        # Sort by p-value (most significant first)
-        features.sort(key=lambda x: x.pValue)
+        # Sort by correlation (highest first) for HSIC, or p-value for traditional tests
+        if self.use_hsic:
+            features.sort(key=lambda x: x.correlation, reverse=True)
+        else:
+            features.sort(key=lambda x: x.pValue)
         
         return features
     
@@ -389,8 +632,10 @@ class BiasDetector:
             'chi_square': TestType.CHI_SQUARE,
             'anova_f_test': TestType.ANOVA,
             'pearson_correlation': TestType.PEARSON,
-            't_test': TestType.T_TEST
+            't_test': TestType.T_TEST,
+            'hsic_nocco': TestType.HSIC if hasattr(TestType, 'HSIC') else TestType.CHI_SQUARE
         }
+        
         return mapping.get(test_type_str, TestType.CHI_SQUARE)
     
     def _classify_effect_size(self, correlation: float) -> EffectSizeLabel:
@@ -404,16 +649,29 @@ class BiasDetector:
         else:
             return EffectSizeLabel.SMALL
     
-    def _classify_sensitivity(self, p_value: float, correlation: float) -> SensitivityLevel:
-        """Classify sensitivity level based on p-value and effect size"""
+    def _classify_sensitivity(self, p_value: float, correlation: float, is_sensitive: bool = False) -> SensitivityLevel:
+        """Classify sensitivity level based on p-value, effect size, and HSIC threshold"""
         abs_corr = abs(correlation)
         
-        if p_value < 0.01 and abs_corr >= 0.3:
-            return SensitivityLevel.HIGHLY_SENSITIVE
-        elif p_value < 0.05 and abs_corr >= 0.1:
-            return SensitivityLevel.MODERATELY_SENSITIVE
+        if self.use_hsic:
+            # For HSIC, use the is_sensitive flag and correlation strength
+            if is_sensitive:
+                if abs_corr >= 0.5:
+                    return SensitivityLevel.HIGHLY_SENSITIVE
+                elif abs_corr >= 0.3:
+                    return SensitivityLevel.MODERATELY_SENSITIVE
+                else:
+                    return SensitivityLevel.LOW_SENSITIVITY
+            else:
+                return SensitivityLevel.LOW_SENSITIVITY
         else:
-            return SensitivityLevel.LOW_SENSITIVITY
+            # Traditional approach based on p-value
+            if p_value < 0.01 and abs_corr >= 0.3:
+                return SensitivityLevel.HIGHLY_SENSITIVE
+            elif p_value < 0.05 and abs_corr >= 0.1:
+                return SensitivityLevel.MODERATELY_SENSITIVE
+            else:
+                return SensitivityLevel.LOW_SENSITIVITY
     
     def _get_feature_groups(self, series: pd.Series) -> List[str]:
         """Get unique groups/values in feature"""
@@ -421,7 +679,7 @@ class BiasDetector:
         
         # Limit to reasonable number of groups for display
         if len(unique_values) <= 10:
-            return [str(val) for val in sorted(unique_values)]
+            return [str(val) for val in sorted(unique_values, key=str)]
         else:
             # For high cardinality, show top 5 most frequent
             top_values = series.value_counts().head(5).index
@@ -433,15 +691,24 @@ class BiasDetector:
         test_type: TestType, 
         p_value: float, 
         correlation: float,
-        groups: List[str]
+        groups: List[str],
+        is_hsic: bool = False
     ) -> str:
         """Generate human-readable description"""
-        significance = "highly significant" if p_value < 0.01 else "significant" if p_value < 0.05 else "not significant"
         effect_magnitude = "strong" if abs(correlation) >= 0.5 else "moderate" if abs(correlation) >= 0.3 else "weak"
         
-        group_info = f" across groups: {', '.join(groups[:3])}" if len(groups) <= 3 else f" across {len(groups)} groups"
+        group_info = ""
+        if len(groups) <= 3:
+            group_info = f" across groups: {', '.join(groups)}"
+        elif len(groups) > 0:
+            group_info = f" across {len(groups)} groups"
         
-        return f"Feature '{feature_name}' shows {significance} association with target ({test_type.value}, p={p_value:.4f}) with {effect_magnitude} effect size{group_info}."
+        if is_hsic:
+            significance = "high" if correlation >= 0.5 else "moderate" if correlation >= 0.3 else "low"
+            return f"Feature '{feature_name}' shows {significance} dependence with target (HSIC/NOCCO={correlation:.3f}) with {effect_magnitude} effect size{group_info}."
+        else:
+            significance = "highly significant" if p_value < 0.01 else "significant" if p_value < 0.05 else "not significant"
+            return f"Feature '{feature_name}' shows {significance} association with target ({test_type.value}, p={p_value:.4f}) with {effect_magnitude} effect size{group_info}."
     
     def _generate_summary(self, features: List[SensitiveFeature]) -> SensitiveFeatureSummary:
         """Generate summary of detection results"""

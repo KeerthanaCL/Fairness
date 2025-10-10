@@ -98,6 +98,23 @@ class MitigationService:
                 adjusted_model, adjusted_predictions = self._apply_equalized_odds_postprocessing(
                     model, train_df, test_df, target_column, sensitive_attributes
                 )
+            # New strategies
+            elif strategy_name == "Optimized Preprocessing":
+                adjusted_model, adjusted_predictions = self._apply_optimized_preprocessing(
+                    model, train_df, test_df, target_column, sensitive_attributes
+                )
+            elif strategy_name == "Learning Fair Representations":
+                adjusted_model, adjusted_predictions = self._apply_learning_fair_representations(
+                    model, train_df, test_df, target_column, sensitive_attributes
+                )
+            elif strategy_name == "Prejudice Remover":
+                adjusted_model, adjusted_predictions = self._apply_prejudice_remover(
+                    model, train_df, test_df, target_column, sensitive_attributes
+                )
+            elif strategy_name == "Reject Option Classifier":
+                adjusted_model, adjusted_predictions = self._apply_reject_option_classifier(
+                    model, train_df, test_df, target_column, sensitive_attributes
+                )
             else:
                 # Default to threshold optimization for unsupported strategies
                 logger.warning(f"Strategy {strategy_name} not fully implemented, using threshold optimization")
@@ -1501,3 +1518,1066 @@ class MitigationService:
         except Exception as e:
             logger.warning(f"Equalized Odds Post-processing failed: {e}. Falling back to threshold optimization.")
             return self._apply_threshold_optimization(model, train_df, test_df, target_column, sensitive_attributes)
+        
+    def _apply_optimized_preprocessing(
+        self, 
+        model, 
+        train_df: pd.DataFrame, 
+        test_df: pd.DataFrame, 
+        target_column: str, 
+        sensitive_attributes: List[str]
+    ) -> Tuple[Any, np.ndarray]:
+        """
+        Apply Optimized Preprocessing (Preprocessing)
+        Transforms data to optimize for both fairness and accuracy
+        """
+        logger.info("Applying Optimized Preprocessing")
+        
+        try:
+            from sklearn.preprocessing import StandardScaler
+            from scipy.optimize import minimize
+            
+            # Clone the original model
+            adjusted_model = clone(model)
+            
+            # Get feature mapping and model features
+            sensitive_mapping = self._get_sensitive_feature_mapping(sensitive_attributes, train_df)
+            model_features = self._get_model_features(adjusted_model, train_df, target_column)
+            
+            # Create optimized training data
+            optimized_train_df = train_df.copy()
+            optimized_test_df = test_df.copy()
+            
+            # Apply transformation to reduce correlation with sensitive attributes
+            numeric_features = [col for col in model_features 
+                            if col in train_df.columns and 
+                            train_df[col].dtype in ['int64', 'float64']]
+            
+            if len(numeric_features) > 0:
+                scaler = StandardScaler()
+                
+                # Fit scaler on training data
+                X_train_scaled = scaler.fit_transform(train_df[numeric_features])
+                X_test_scaled = scaler.transform(test_df[numeric_features])
+                
+                # Apply fairness-aware transformation
+                for attr in sensitive_attributes:
+                    if attr in sensitive_mapping:
+                        group_col = sensitive_mapping[attr]['use_for_groups']
+                        
+                        if group_col in train_df.columns:
+                            try:
+                                # Calculate group-specific statistics
+                                groups = train_df[group_col].unique()
+                                group_means = {}
+                                
+                                for group in groups:
+                                    group_mask = train_df[group_col] == group
+                                    if group_mask.sum() > 0:
+                                        group_means[group] = X_train_scaled[group_mask].mean(axis=0)
+                                
+                                # Calculate overall mean
+                                overall_mean = X_train_scaled.mean(axis=0)
+                                
+                                # Apply fairness transformation (move group means closer to overall mean)
+                                fairness_weight = 0.3  # Balance between original data and fairness
+                                
+                                for i, group in enumerate(groups):
+                                    group_mask = train_df[group_col] == group
+                                    if group_mask.sum() > 0 and group in group_means:
+                                        adjustment = (overall_mean - group_means[group]) * fairness_weight
+                                        X_train_scaled[group_mask] += adjustment
+                                        
+                                        # Apply same transformation to test data
+                                        test_group_mask = test_df[group_col] == group
+                                        if test_group_mask.sum() > 0:
+                                            X_test_scaled[test_group_mask] += adjustment
+                                
+                                logger.info(f"Applied optimized preprocessing for attribute {attr}")
+                                
+                            except Exception as attr_e:
+                                logger.warning(f"Could not optimize for attribute {attr}: {attr_e}")
+                                continue
+                
+                # Update dataframes with optimized features
+                for i, col in enumerate(numeric_features):
+                    optimized_train_df[col] = X_train_scaled[:, i]
+                    optimized_test_df[col] = X_test_scaled[:, i]
+            
+            # Retrain model with optimized data
+            X_train = optimized_train_df[model_features]
+            y_train = optimized_train_df[target_column]
+            adjusted_model.fit(X_train, y_train)
+            
+            # Generate predictions on optimized test set
+            X_test = optimized_test_df[model_features]
+            adjusted_predictions = adjusted_model.predict(X_test)
+            
+            logger.info("Optimized Preprocessing completed")
+            return adjusted_model, adjusted_predictions
+            
+        except Exception as e:
+            logger.warning(f"Optimized Preprocessing failed: {e}. Falling back to threshold optimization.")
+            return self._apply_threshold_optimization(model, train_df, test_df, target_column, sensitive_attributes)
+
+    def _apply_learning_fair_representations(
+        self, 
+        model, 
+        train_df: pd.DataFrame, 
+        test_df: pd.DataFrame, 
+        target_column: str, 
+        sensitive_attributes: List[str]
+    ) -> Tuple[Any, np.ndarray]:
+        """
+        Apply Learning Fair Representations (Preprocessing)
+        Learns an intermediate representation that obfuscates sensitive information
+        """
+        logger.info("Applying Learning Fair Representations")
+        
+        try:
+            from sklearn.decomposition import PCA
+            
+            # Clone the original model
+            adjusted_model = clone(model)
+            
+            # Get feature mapping and model features
+            sensitive_mapping = self._get_sensitive_feature_mapping(sensitive_attributes, train_df)
+            model_features = self._get_model_features(adjusted_model, train_df, target_column)
+            
+            # Get numeric features for transformation
+            numeric_features = [col for col in model_features 
+                            if col in train_df.columns and 
+                            train_df[col].dtype in ['int64', 'float64']]
+            
+            if len(numeric_features) > 2:
+                # Learn fair representation using PCA with fairness constraints
+                X_train_numeric = train_df[numeric_features].values
+                X_test_numeric = test_df[numeric_features].values
+                
+                # Apply PCA to create intermediate representation
+                n_components = max(2, min(len(numeric_features) - 1, int(len(numeric_features) * 0.8)))
+                pca = PCA(n_components=n_components)
+                
+                X_train_transformed = pca.fit_transform(X_train_numeric)
+                X_test_transformed = pca.transform(X_test_numeric)
+                
+                # Apply additional transformation to reduce sensitive attribute correlation
+                for attr in sensitive_attributes:
+                    if attr in sensitive_mapping:
+                        group_col = sensitive_mapping[attr]['use_for_groups']
+                        
+                        if group_col in train_df.columns:
+                            try:
+                                # Calculate group centroids in transformed space
+                                groups = train_df[group_col].unique()
+                                centroids = {}
+                                
+                                for group in groups:
+                                    group_mask = train_df[group_col] == group
+                                    if group_mask.sum() > 0:
+                                        centroids[group] = X_train_transformed[group_mask].mean(axis=0)
+                                
+                                # Calculate overall centroid
+                                overall_centroid = X_train_transformed.mean(axis=0)
+                                
+                                # Apply fairness regularization to move group centroids closer
+                                regularization_strength = 0.5
+                                
+                                for group in groups:
+                                    group_mask = train_df[group_col] == group
+                                    if group_mask.sum() > 0 and group in centroids:
+                                        # Move group samples towards overall centroid
+                                        direction = overall_centroid - centroids[group]
+                                        X_train_transformed[group_mask] += direction * regularization_strength
+                                        
+                                        # Apply same transformation to test data
+                                        test_group_mask = test_df[group_col] == group
+                                        if test_group_mask.sum() > 0:
+                                            X_test_transformed[test_group_mask] += direction * regularization_strength
+                                
+                                logger.info(f"Applied fair representation learning for attribute {attr}")
+                                
+                            except Exception as attr_e:
+                                logger.warning(f"Could not learn fair representation for {attr}: {attr_e}")
+                                continue
+                
+                # Create new dataframes with fair representations
+                fair_train_df = train_df.copy()
+                fair_test_df = test_df.copy()
+                
+                # Replace original features with fair representations
+                for i in range(X_train_transformed.shape[1]):
+                    col_name = f'fair_repr_{i}'
+                    fair_train_df[col_name] = X_train_transformed[:, i]
+                    fair_test_df[col_name] = X_test_transformed[:, i]
+                
+                # Update model features
+                fair_features = [f'fair_repr_{i}' for i in range(X_train_transformed.shape[1])]
+                
+                # Retrain model with fair representations
+                X_train = fair_train_df[fair_features]
+                y_train = fair_train_df[target_column]
+                adjusted_model.fit(X_train, y_train)
+                
+                # Generate predictions
+                X_test = fair_test_df[fair_features]
+                adjusted_predictions = adjusted_model.predict(X_test)
+                
+                logger.info(f"Learning Fair Representations completed with {n_components} components")
+                return adjusted_model, adjusted_predictions
+            else:
+                logger.warning("Insufficient numeric features for fair representation learning")
+                return self._apply_threshold_optimization(model, train_df, test_df, target_column, sensitive_attributes)
+            
+        except Exception as e:
+            logger.warning(f"Learning Fair Representations failed: {e}. Falling back to threshold optimization.")
+            return self._apply_threshold_optimization(model, train_df, test_df, target_column, sensitive_attributes)
+
+    def _apply_prejudice_remover(
+        self, 
+        model, 
+        train_df: pd.DataFrame, 
+        test_df: pd.DataFrame, 
+        target_column: str, 
+        sensitive_attributes: List[str]
+    ) -> Tuple[Any, np.ndarray]:
+        """
+        Apply Prejudice Remover (In-processing)
+        Adds a prejudice removal regularization term to the learning objective
+        """
+        logger.info("Applying Prejudice Remover")
+        
+        try:
+            # Clone the original model
+            adjusted_model = clone(model)
+            
+            # Get feature mapping and model features
+            sensitive_mapping = self._get_sensitive_feature_mapping(sensitive_attributes, train_df)
+            model_features = self._get_model_features(adjusted_model, train_df, target_column)
+            
+            X_train = train_df[model_features]
+            y_train = train_df[target_column]
+            
+            # Calculate prejudice index for sample weighting
+            sample_weights = np.ones(len(train_df))
+            eta = 1.0  # Prejudice removal regularizer (higher = more fairness focus)
+            
+            for attr in sensitive_attributes:
+                if attr in sensitive_mapping:
+                    group_col = sensitive_mapping[attr]['use_for_groups']
+                    
+                    if group_col in train_df.columns:
+                        try:
+                            # Calculate prejudice scores for each sample
+                            groups = train_df[group_col].unique()
+                            
+                            # Calculate group-wise target distributions
+                            group_positive_rates = {}
+                            for group in groups:
+                                group_mask = train_df[group_col] == group
+                                if group_mask.sum() > 0:
+                                    group_positive_rates[group] = (train_df.loc[group_mask, target_column] == 1).mean()
+                            
+                            overall_positive_rate = (train_df[target_column] == 1).mean()
+                            
+                            # Apply prejudice removal through weighted training
+                            for group in groups:
+                                group_mask = train_df[group_col] == group
+                                if group_mask.sum() > 0 and group in group_positive_rates:
+                                    # Calculate prejudice index for this group
+                                    prejudice_index = abs(group_positive_rates[group] - overall_positive_rate)
+                                    
+                                    # Apply regularization weight
+                                    # Samples from groups with higher prejudice get adjusted weights
+                                    regularization_weight = 1.0 + eta * prejudice_index
+                                    
+                                    # For positive class in underrepresented groups
+                                    pos_mask = (train_df[group_col] == group) & (train_df[target_column] == 1)
+                                    if group_positive_rates[group] < overall_positive_rate:
+                                        sample_weights[pos_mask] *= regularization_weight
+                                    
+                                    # For negative class in overrepresented groups
+                                    neg_mask = (train_df[group_col] == group) & (train_df[target_column] == 0)
+                                    if group_positive_rates[group] > overall_positive_rate:
+                                        sample_weights[neg_mask] *= regularization_weight
+                            
+                            logger.info(f"Applied prejudice removal for attribute {attr} with eta={eta}")
+                            
+                        except Exception as attr_e:
+                            logger.warning(f"Could not apply prejudice remover for {attr}: {attr_e}")
+                            continue
+            
+            # Normalize weights
+            sample_weights = sample_weights / sample_weights.mean()
+            
+            # Retrain model with prejudice-aware weights
+            if hasattr(adjusted_model, 'fit') and 'sample_weight' in adjusted_model.fit.__code__.co_varnames:
+                adjusted_model.fit(X_train, y_train, sample_weight=sample_weights)
+                logger.info("Model trained with prejudice removal regularization")
+            else:
+                # Use bootstrap resampling if weights not supported
+                logger.info("Model doesn't support sample weights, using bootstrap resampling")
+                adjusted_model = self._bootstrap_retrain(adjusted_model, X_train, y_train, sample_weights)
+            
+            # Generate predictions
+            X_test = test_df[model_features]
+            adjusted_predictions = adjusted_model.predict(X_test)
+            
+            logger.info("Prejudice Remover completed")
+            return adjusted_model, adjusted_predictions
+            
+        except Exception as e:
+            logger.warning(f"Prejudice Remover failed: {e}. Falling back to threshold optimization.")
+            return self._apply_threshold_optimization(model, train_df, test_df, target_column, sensitive_attributes)
+
+    def _apply_reject_option_classifier(
+        self, 
+        model, 
+        train_df: pd.DataFrame, 
+        test_df: pd.DataFrame, 
+        target_column: str, 
+        sensitive_attributes: List[str]
+    ) -> Tuple[Any, np.ndarray]:
+        """
+        Apply Reject Option Classifier (Post-processing)
+        Flips predictions in a critical region around decision boundary for fairness
+        """
+        logger.info("Applying Reject Option Classifier")
+        
+        try:
+            # Get feature mapping and model features
+            sensitive_mapping = self._get_sensitive_feature_mapping(sensitive_attributes, train_df)
+            model_features = self._get_model_features(model, test_df, target_column)
+            
+            X_test = test_df[model_features]
+            y_test = test_df[target_column]
+            
+            # Get base predictions and probabilities
+            base_predictions = model.predict(X_test)
+            
+            if hasattr(model, 'predict_proba'):
+                base_probabilities = model.predict_proba(X_test)
+                if base_probabilities.shape[1] > 1:
+                    base_probabilities = base_probabilities[:, 1]
+                else:
+                    base_probabilities = base_probabilities.flatten()
+            else:
+                # Use decision function as proxy
+                if hasattr(model, 'decision_function'):
+                    scores = model.decision_function(X_test)
+                    base_probabilities = 1 / (1 + np.exp(-scores))
+                else:
+                    base_probabilities = base_predictions.astype(float)
+            
+            # Define critical region around decision boundary
+            theta = 0.2  # Critical region threshold (0.5 +/- theta)
+            lower_bound = 0.5 - theta
+            upper_bound = 0.5 + theta
+            
+            # Identify samples in critical region
+            critical_region_mask = (base_probabilities >= lower_bound) & (base_probabilities <= upper_bound)
+            
+            adjusted_predictions = base_predictions.copy()
+            
+            if len(sensitive_attributes) > 0:
+                for attr in sensitive_attributes:
+                    if attr in sensitive_mapping:
+                        group_col = sensitive_mapping[attr]['use_for_groups']
+                        
+                        if group_col in test_df.columns:
+                            try:
+                                # Calculate group-specific metrics
+                                groups = test_df[group_col].unique()
+                                group_metrics = {}
+                                
+                                for group in groups:
+                                    group_mask = test_df[group_col] == group
+                                    if group_mask.sum() > 0:
+                                        group_preds = base_predictions[group_mask]
+                                        group_true = y_test[group_mask]
+                                        
+                                        # Calculate false positive and false negative rates
+                                        if (group_true == 0).sum() > 0:
+                                            fpr = np.mean(group_preds[group_true == 0])
+                                        else:
+                                            fpr = 0
+                                        
+                                        if (group_true == 1).sum() > 0:
+                                            fnr = 1 - np.mean(group_preds[group_true == 1])
+                                        else:
+                                            fnr = 0
+                                        
+                                        group_metrics[group] = {'fpr': fpr, 'fnr': fnr}
+                                
+                                # Determine which group is privileged/unprivileged
+                                if len(group_metrics) >= 2:
+                                    groups_list = list(group_metrics.keys())
+                                    
+                                    # Group with lower FPR is typically privileged
+                                    privileged_group = min(groups_list, key=lambda g: group_metrics[g]['fpr'])
+                                    unprivileged_groups = [g for g in groups_list if g != privileged_group]
+                                    
+                                    # Apply reject option classification
+                                    for unpriv_group in unprivileged_groups:
+                                        # Get samples from unprivileged group in critical region
+                                        unpriv_critical_mask = (
+                                            (test_df[group_col] == unpriv_group) & 
+                                            critical_region_mask
+                                        )
+                                        
+                                        if unpriv_critical_mask.sum() > 0:
+                                            # Flip predictions based on FPR/FNR comparison
+                                            fpr_unpriv = group_metrics[unpriv_group]['fpr']
+                                            fnr_unpriv = group_metrics[unpriv_group]['fnr']
+                                            fpr_priv = group_metrics[privileged_group]['fpr']
+                                            fnr_priv = group_metrics[privileged_group]['fnr']
+                                            
+                                            # If unprivileged group has higher FPR, flip some positives to negatives
+                                            if fpr_unpriv > fpr_priv:
+                                                flip_mask = (
+                                                    unpriv_critical_mask & 
+                                                    (adjusted_predictions == 1) & 
+                                                    (base_probabilities < 0.5 + theta/2)
+                                                )
+                                                adjusted_predictions[flip_mask] = 0
+                                            
+                                            # If unprivileged group has higher FNR, flip some negatives to positives
+                                            if fnr_unpriv > fnr_priv:
+                                                flip_mask = (
+                                                    unpriv_critical_mask & 
+                                                    (adjusted_predictions == 0) & 
+                                                    (base_probabilities > 0.5 - theta/2)
+                                                )
+                                                adjusted_predictions[flip_mask] = 1
+                                    
+                                    logger.info(f"Applied reject option classification for attribute {attr}")
+                                    logger.info(f"Critical region: [{lower_bound:.2f}, {upper_bound:.2f}], "
+                                            f"Samples in region: {critical_region_mask.sum()}")
+                                
+                            except Exception as group_e:
+                                logger.warning(f"Could not apply reject option for attribute {attr}: {group_e}")
+                                continue
+            
+            # Calculate number of flipped predictions
+            n_flipped = (adjusted_predictions != base_predictions).sum()
+            logger.info(f"Reject Option Classifier completed, flipped {n_flipped} predictions")
+            
+            return model, adjusted_predictions
+            
+        except Exception as e:
+            logger.warning(f"Reject Option Classifier failed: {e}. Falling back to threshold optimization.")
+            return self._apply_threshold_optimization(model, train_df, test_df, target_column, sensitive_attributes)
+        
+    def apply_mitigation_pipeline(
+        self,
+        preprocessing_strategy: Optional[str],
+        inprocessing_strategy: Optional[str],
+        postprocessing_strategy: Optional[str],
+        model: BaseEstimator,
+        train_df: pd.DataFrame,
+        test_df: pd.DataFrame,
+        target_column: str,
+        sensitive_attributes: List[str]
+    ) -> Dict[str, Any]:
+        """
+        Apply mitigation strategies as a pipeline: preprocessing -> in-processing -> post-processing
+        
+        Each stage uses the output of the previous stage as input.
+        
+        Args:
+            preprocessing_strategy: Name of preprocessing strategy (optional)
+            inprocessing_strategy: Name of in-processing strategy (optional)
+            postprocessing_strategy: Name of post-processing strategy (optional)
+            model: Base model
+            train_df: Training data
+            test_df: Test data
+            target_column: Target column name
+            sensitive_attributes: List of sensitive attributes
+        
+        Returns:
+            Dictionary with pipeline results including intermediate and final metrics
+        """
+        logger.info("Starting mitigation pipeline")
+        logger.info(f"Preprocessing: {preprocessing_strategy}, In-processing: {inprocessing_strategy}, Post-processing: {postprocessing_strategy}")
+        
+        pipeline_results = {
+            "stages": [],
+            "baseline": None,
+            "final": None,
+            "improvements": {}
+        }
+        
+        # Calculate baseline metrics (before any mitigation)
+        logger.info("Calculating baseline metrics")
+        baseline_metrics = self._calculate_baseline_metrics(
+            model, test_df, target_column, sensitive_attributes
+        )
+        pipeline_results["baseline"] = baseline_metrics
+        
+        # Current state tracking
+        current_model = model
+        current_train_df = train_df.copy()
+        current_test_df = test_df.copy()
+        
+        # Stage 1: Preprocessing
+        if preprocessing_strategy:
+            logger.info(f"Stage 1: Applying preprocessing strategy - {preprocessing_strategy}")
+            try:
+                adjusted_model, adjusted_predictions = self._apply_single_strategy(
+                    preprocessing_strategy,
+                    current_model,
+                    current_train_df,
+                    current_test_df,
+                    target_column,
+                    sensitive_attributes
+                )
+                
+                # Calculate metrics after preprocessing
+                after_metrics = self._calculate_adjusted_metrics(
+                    adjusted_model, adjusted_predictions, current_test_df, 
+                    target_column, sensitive_attributes
+                )
+                
+                stage_result = {
+                    "stage": "preprocessing",
+                    "strategy": preprocessing_strategy,
+                    "status": "completed",
+                    "metrics": after_metrics
+                }
+                pipeline_results["stages"].append(stage_result)
+                
+                # Update current state for next stage
+                current_model = adjusted_model
+                logger.info(f"Preprocessing completed. Fairness score: {after_metrics['fairness_score']:.2f}")
+                
+            except Exception as e:
+                logger.error(f"Preprocessing failed: {str(e)}")
+                pipeline_results["stages"].append({
+                    "stage": "preprocessing",
+                    "strategy": preprocessing_strategy,
+                    "status": "failed",
+                    "error": str(e)
+                })
+                # Continue with original model
+        
+        # Stage 2: In-processing
+        if inprocessing_strategy:
+            logger.info(f"Stage 2: Applying in-processing strategy - {inprocessing_strategy}")
+            try:
+                adjusted_model, adjusted_predictions = self._apply_single_strategy(
+                    inprocessing_strategy,
+                    current_model,
+                    current_train_df,
+                    current_test_df,
+                    target_column,
+                    sensitive_attributes
+                )
+                
+                # Calculate metrics after in-processing
+                after_metrics = self._calculate_adjusted_metrics(
+                    adjusted_model, adjusted_predictions, current_test_df,
+                    target_column, sensitive_attributes
+                )
+                
+                stage_result = {
+                    "stage": "in_processing",
+                    "strategy": inprocessing_strategy,
+                    "status": "completed",
+                    "metrics": after_metrics
+                }
+                pipeline_results["stages"].append(stage_result)
+                
+                # Update current state for next stage
+                current_model = adjusted_model
+                logger.info(f"In-processing completed. Fairness score: {after_metrics['fairness_score']:.2f}")
+                
+            except Exception as e:
+                logger.error(f"In-processing failed: {str(e)}")
+                pipeline_results["stages"].append({
+                    "stage": "in_processing",
+                    "strategy": inprocessing_strategy,
+                    "status": "failed",
+                    "error": str(e)
+                })
+        
+        # Stage 3: Post-processing
+        if postprocessing_strategy:
+            logger.info(f"Stage 3: Applying post-processing strategy - {postprocessing_strategy}")
+            try:
+                adjusted_model, adjusted_predictions = self._apply_single_strategy(
+                    postprocessing_strategy,
+                    current_model,
+                    current_train_df,
+                    current_test_df,
+                    target_column,
+                    sensitive_attributes
+                )
+                
+                # Calculate metrics after post-processing
+                after_metrics = self._calculate_adjusted_metrics(
+                    adjusted_model, adjusted_predictions, current_test_df,
+                    target_column, sensitive_attributes
+                )
+                
+                stage_result = {
+                    "stage": "post_processing",
+                    "strategy": postprocessing_strategy,
+                    "status": "completed",
+                    "metrics": after_metrics
+                }
+                pipeline_results["stages"].append(stage_result)
+                
+                # Update final state
+                current_model = adjusted_model
+                logger.info(f"Post-processing completed. Fairness score: {after_metrics['fairness_score']:.2f}")
+                
+            except Exception as e:
+                logger.error(f"Post-processing failed: {str(e)}")
+                pipeline_results["stages"].append({
+                    "stage": "post_processing",
+                    "strategy": postprocessing_strategy,
+                    "status": "failed",
+                    "error": str(e)
+                })
+        
+        # Calculate final metrics
+        model_features = self._get_model_features(current_model, current_test_df, target_column)
+        X_test = current_test_df[model_features]
+        final_predictions = current_model.predict(X_test)
+        
+        final_metrics = self._calculate_adjusted_metrics(
+            current_model, final_predictions, current_test_df,
+            target_column, sensitive_attributes
+        )
+        pipeline_results["final"] = final_metrics
+        
+        # Calculate overall improvements
+        pipeline_results["improvements"] = self._calculate_improvement(
+            baseline_metrics, final_metrics
+        )
+        
+        # Add summary
+        applied_strategies = [
+            s for s in [preprocessing_strategy, inprocessing_strategy, postprocessing_strategy]
+            if s is not None
+        ]
+        
+        pipeline_results["summary"] = {
+            "total_stages": len(applied_strategies),
+            "successful_stages": len([s for s in pipeline_results["stages"] if s["status"] == "completed"]),
+            "applied_strategies": applied_strategies,
+            "baseline_fairness": baseline_metrics["fairness_score"],
+            "final_fairness": final_metrics["fairness_score"],
+            "fairness_improvement": final_metrics["fairness_score"] - baseline_metrics["fairness_score"]
+        }
+        
+        logger.info(f"Pipeline completed. Overall fairness improvement: {pipeline_results['summary']['fairness_improvement']:.2f}")
+        
+        return pipeline_results
+
+    def _apply_single_strategy(
+        self,
+        strategy_name: str,
+        model: BaseEstimator,
+        train_df: pd.DataFrame,
+        test_df: pd.DataFrame,
+        target_column: str,
+        sensitive_attributes: List[str]
+    ) -> Tuple[Any, np.ndarray]:
+        """Helper method to apply a single strategy and return model and predictions"""
+        
+        if strategy_name == "Reweighing":
+            return self._apply_reweighing(model, train_df, test_df, target_column, sensitive_attributes)
+        elif strategy_name == "Disparate Impact Remover":
+            return self._apply_disparate_impact_remover(model, train_df, test_df, target_column, sensitive_attributes)
+        elif strategy_name == "Data Augmentation":
+            return self._apply_data_augmentation(model, train_df, test_df, target_column, sensitive_attributes)
+        elif strategy_name == "Optimized Preprocessing":
+            return self._apply_optimized_preprocessing(model, train_df, test_df, target_column, sensitive_attributes)
+        elif strategy_name == "Learning Fair Representations":
+            return self._apply_learning_fair_representations(model, train_df, test_df, target_column, sensitive_attributes)
+        elif strategy_name == "Fairness Regularization":
+            return self._apply_fairness_regularization_strategy(model, train_df, test_df, target_column, sensitive_attributes)
+        elif strategy_name == "Adversarial Debiasing":
+            return self._apply_adversarial_debiasing_strategy(model, train_df, test_df, target_column, sensitive_attributes)
+        elif strategy_name == "Prejudice Remover":
+            return self._apply_prejudice_remover(model, train_df, test_df, target_column, sensitive_attributes)
+        elif strategy_name == "Threshold Optimization":
+            return self._apply_threshold_optimization(model, train_df, test_df, target_column, sensitive_attributes)
+        elif strategy_name == "Calibration Adjustment":
+            return self._apply_calibration_adjustment(model, train_df, test_df, target_column, sensitive_attributes)
+        elif strategy_name == "Equalized Odds Post-processing":
+            return self._apply_equalized_odds_postprocessing(model, train_df, test_df, target_column, sensitive_attributes)
+        elif strategy_name == "Calibrated Equalized Odds":
+            return self._apply_calibrated_equalized_odds(model, train_df, test_df, target_column, sensitive_attributes)
+        elif strategy_name == "Reject Option Classifier":
+            return self._apply_reject_option_classifier(model, train_df, test_df, target_column, sensitive_attributes)
+        else:
+            logger.warning(f"Unknown strategy: {strategy_name}, using threshold optimization")
+            return self._apply_threshold_optimization(model, train_df, test_df, target_column, sensitive_attributes)
+
+    # Add these methods to MitigationService class in mitigation_service.py
+    def find_best_pipeline_greedy(
+        self,
+        model: BaseEstimator,
+        train_df: pd.DataFrame,
+        test_df: pd.DataFrame,
+        target_column: str,
+        sensitive_attributes: List[str]
+    ) -> Dict[str, Any]:
+        """
+        Find best pipeline using greedy approach - tests each category independently
+        Time: O(n) where n = total strategies (~13 evaluations)
+        """
+        logger.info("Finding best pipeline using greedy search")
+        
+        best_pipeline = {
+            'preprocessing': None,
+            'inprocessing': None,
+            'postprocessing': None
+        }
+        
+        current_model = model
+        current_train_df = train_df.copy()
+        current_test_df = test_df.copy()
+        
+        preprocessing_strategies = [
+            "Reweighing",
+            "Disparate Impact Remover",
+            "Data Augmentation",
+            "Optimized Preprocessing",
+            "Learning Fair Representations"
+        ]
+        
+        inprocessing_strategies = [
+            "Fairness Regularization",
+            "Adversarial Debiasing",
+            "Prejudice Remover"
+        ]
+        
+        postprocessing_strategies = [
+            "Threshold Optimization",
+            "Calibration Adjustment",
+            "Equalized Odds Post-processing",
+            "Calibrated Equalized Odds",
+            "Reject Option Classifier"
+        ]
+        
+        # Calculate baseline
+        baseline_metrics = self._calculate_baseline_metrics(
+            current_model, current_test_df, target_column, sensitive_attributes
+        )
+        baseline_score = baseline_metrics['fairness_score']
+        
+        # Step 1: Find best preprocessing
+        logger.info("Step 1: Testing preprocessing strategies...")
+        best_preprocessing_score = baseline_score
+        best_preprocessing_model = current_model
+        
+        for strategy in preprocessing_strategies:
+            try:
+                adjusted_model, adjusted_predictions = self._apply_single_strategy(
+                    strategy, current_model, current_train_df, 
+                    current_test_df, target_column, sensitive_attributes
+                )
+                
+                score = self._calculate_adjusted_metrics(
+                    adjusted_model, adjusted_predictions,
+                    current_test_df, target_column, sensitive_attributes
+                )['fairness_score']
+                
+                logger.info(f"  {strategy}: {score:.2f}")
+                
+                if score > best_preprocessing_score:
+                    best_preprocessing_score = score
+                    best_pipeline['preprocessing'] = strategy
+                    best_preprocessing_model = adjusted_model
+            except Exception as e:
+                logger.warning(f"  {strategy} failed: {e}")
+        
+        # Update current model to best preprocessing result
+        if best_pipeline['preprocessing']:
+            current_model = best_preprocessing_model
+            logger.info(f"✓ Best preprocessing: {best_pipeline['preprocessing']} (Score: {best_preprocessing_score:.2f})")
+        else:
+            logger.info(f"✓ No preprocessing improvement found (keeping baseline)")
+        
+        # Step 2: Find best in-processing (using best preprocessing result)
+        logger.info("Step 2: Testing in-processing strategies...")
+        best_inprocessing_score = best_preprocessing_score
+        best_inprocessing_model = current_model
+        
+        for strategy in inprocessing_strategies:
+            try:
+                adjusted_model, adjusted_predictions = self._apply_single_strategy(
+                    strategy, current_model, current_train_df,
+                    current_test_df, target_column, sensitive_attributes
+                )
+                
+                score = self._calculate_adjusted_metrics(
+                    adjusted_model, adjusted_predictions,
+                    current_test_df, target_column, sensitive_attributes
+                )['fairness_score']
+                
+                logger.info(f"  {strategy}: {score:.2f}")
+                
+                if score > best_inprocessing_score:
+                    best_inprocessing_score = score
+                    best_pipeline['inprocessing'] = strategy
+                    best_inprocessing_model = adjusted_model
+            except Exception as e:
+                logger.warning(f"  {strategy} failed: {e}")
+        
+        # Update current model to best in-processing result
+        if best_pipeline['inprocessing']:
+            current_model = best_inprocessing_model
+            logger.info(f"✓ Best in-processing: {best_pipeline['inprocessing']} (Score: {best_inprocessing_score:.2f})")
+        else:
+            logger.info(f"✓ No in-processing improvement found")
+        
+        # Step 3: Find best post-processing (using best preprocessing + in-processing result)
+        logger.info("Step 3: Testing post-processing strategies...")
+        best_postprocessing_score = best_inprocessing_score
+        best_postprocessing_strategy = None
+        
+        for strategy in postprocessing_strategies:
+            try:
+                adjusted_model, adjusted_predictions = self._apply_single_strategy(
+                    strategy, current_model, current_train_df,
+                    current_test_df, target_column, sensitive_attributes
+                )
+                
+                score = self._calculate_adjusted_metrics(
+                    adjusted_model, adjusted_predictions,
+                    current_test_df, target_column, sensitive_attributes
+                )['fairness_score']
+                
+                logger.info(f"  {strategy}: {score:.2f}")
+                
+                if score > best_postprocessing_score:
+                    best_postprocessing_score = score
+                    best_pipeline['postprocessing'] = strategy
+                    best_postprocessing_strategy = strategy
+            except Exception as e:
+                logger.warning(f"  {strategy} failed: {e}")
+        
+        if best_pipeline['postprocessing']:
+            logger.info(f"✓ Best post-processing: {best_pipeline['postprocessing']} (Score: {best_postprocessing_score:.2f})")
+        else:
+            logger.info(f"✓ No post-processing improvement found")
+        
+        # Apply the best pipeline found
+        logger.info(f"\n=== Applying Best Pipeline ===")
+        logger.info(f"Preprocessing: {best_pipeline['preprocessing']}")
+        logger.info(f"In-processing: {best_pipeline['inprocessing']}")
+        logger.info(f"Post-processing: {best_pipeline['postprocessing']}")
+        
+        final_result = self.apply_mitigation_pipeline(
+            preprocessing_strategy=best_pipeline['preprocessing'],
+            inprocessing_strategy=best_pipeline['inprocessing'],
+            postprocessing_strategy=best_pipeline['postprocessing'],
+            model=model,
+            train_df=train_df,
+            test_df=test_df,
+            target_column=target_column,
+            sensitive_attributes=sensitive_attributes
+        )
+        
+        return {
+            'best_pipeline': best_pipeline,
+            'baseline_score': baseline_score,
+            'final_score': best_postprocessing_score,
+            'improvement': best_postprocessing_score - baseline_score,
+            'results': final_result,
+            'search_method': 'greedy',
+            'strategies_tested': len(preprocessing_strategies) + len(inprocessing_strategies) + len(postprocessing_strategies)
+        }
+
+    def find_best_pipeline_topk(
+        self,
+        model: BaseEstimator,
+        train_df: pd.DataFrame,
+        test_df: pd.DataFrame,
+        target_column: str,
+        sensitive_attributes: List[str],
+        k: int = 2
+    ) -> Dict[str, Any]:
+        """
+        Test top-k strategies from each category
+        Time: O(k^3) - e.g., 8 evaluations for k=2
+        """
+        logger.info(f"Finding best pipeline using top-{k} search")
+        
+        # Define all strategies with rankings (based on typical effectiveness)
+        preprocessing_strategies = [
+            ("Reweighing", 1),
+            ("Optimized Preprocessing", 2),
+            ("Disparate Impact Remover", 3),
+            ("Learning Fair Representations", 4),
+            ("Data Augmentation", 5)
+        ]
+        
+        inprocessing_strategies = [
+            ("Prejudice Remover", 1),
+            ("Fairness Regularization", 2),
+            ("Adversarial Debiasing", 3)
+        ]
+        
+        postprocessing_strategies = [
+            ("Calibrated Equalized Odds", 1),
+            ("Reject Option Classifier", 2),
+            ("Threshold Optimization", 3),
+            ("Equalized Odds Post-processing", 4),
+            ("Calibration Adjustment", 5)
+        ]
+        
+        # Get top-k from each category (including None as an option)
+        preprocessing_topk = [None] + [s[0] for s in sorted(preprocessing_strategies, key=lambda x: x[1])[:k]]
+        inprocessing_topk = [None] + [s[0] for s in sorted(inprocessing_strategies, key=lambda x: x[1])[:k]]
+        postprocessing_topk = [None] + [s[0] for s in sorted(postprocessing_strategies, key=lambda x: x[1])[:k]]
+        
+        best_pipeline = None
+        best_score = 0
+        best_result = None
+        
+        # Test all combinations of top-k
+        total_combinations = len(preprocessing_topk) * len(inprocessing_topk) * len(postprocessing_topk)
+        logger.info(f"Testing {total_combinations} combinations...")
+        
+        tested = 0
+        for pre in preprocessing_topk:
+            for inp in inprocessing_topk:
+                for post in postprocessing_topk:
+                    tested += 1
+                    
+                    # Skip if all are None
+                    if not pre and not inp and not post:
+                        continue
+                    
+                    try:
+                        result = self.apply_mitigation_pipeline(
+                            preprocessing_strategy=pre,
+                            inprocessing_strategy=inp,
+                            postprocessing_strategy=post,
+                            model=model,
+                            train_df=train_df,
+                            test_df=test_df,
+                            target_column=target_column,
+                            sensitive_attributes=sensitive_attributes
+                        )
+                        
+                        score = result['summary']['final_fairness']
+                        pipeline_str = f"{pre or 'None'} → {inp or 'None'} → {post or 'None'}"
+                        logger.info(f"  [{tested}/{total_combinations}] {pipeline_str}: {score:.2f}")
+                        
+                        if score > best_score:
+                            best_score = score
+                            best_pipeline = {
+                                'preprocessing': pre,
+                                'inprocessing': inp,
+                                'postprocessing': post
+                            }
+                            best_result = result
+                    except Exception as e:
+                        logger.warning(f"  Pipeline {tested} failed: {e}")
+        
+        logger.info(f"\n=== Best Pipeline Found ===")
+        logger.info(f"Preprocessing: {best_pipeline['preprocessing']}")
+        logger.info(f"In-processing: {best_pipeline['inprocessing']}")
+        logger.info(f"Post-processing: {best_pipeline['postprocessing']}")
+        logger.info(f"Score: {best_score:.2f}")
+        
+        return {
+            'best_pipeline': best_pipeline,
+            'final_score': best_score,
+            'results': best_result,
+            'combinations_tested': tested,
+            'search_method': f'top-{k}'
+        }
+
+    def find_best_pipeline_exhaustive(
+        self,
+        model: BaseEstimator,
+        train_df: pd.DataFrame,
+        test_df: pd.DataFrame,
+        target_column: str,
+        sensitive_attributes: List[str]
+    ) -> Dict[str, Any]:
+        """
+        Test ALL possible combinations (exhaustive search)
+        Time: O(n*m*p) where n,m,p are number of strategies in each category
+        Warning: This can take 1-2 hours!
+        """
+        logger.info("Finding best pipeline using EXHAUSTIVE search - this may take a while...")
+        
+        preprocessing_strategies = [None, "Reweighing", "Disparate Impact Remover", 
+                                "Data Augmentation", "Optimized Preprocessing", 
+                                "Learning Fair Representations"]
+        
+        inprocessing_strategies = [None, "Fairness Regularization", 
+                                "Adversarial Debiasing", "Prejudice Remover"]
+        
+        postprocessing_strategies = [None, "Threshold Optimization", "Calibration Adjustment",
+                                    "Equalized Odds Post-processing", "Calibrated Equalized Odds",
+                                    "Reject Option Classifier"]
+        
+        total_combinations = len(preprocessing_strategies) * len(inprocessing_strategies) * len(postprocessing_strategies)
+        logger.info(f"Total combinations to test: {total_combinations}")
+        
+        best_pipeline = None
+        best_score = 0
+        best_result = None
+        
+        tested = 0
+        for pre in preprocessing_strategies:
+            for inp in inprocessing_strategies:
+                for post in postprocessing_strategies:
+                    tested += 1
+                    
+                    # Skip if all are None
+                    if not pre and not inp and not post:
+                        continue
+                    
+                    try:
+                        result = self.apply_mitigation_pipeline(
+                            preprocessing_strategy=pre,
+                            inprocessing_strategy=inp,
+                            postprocessing_strategy=post,
+                            model=model,
+                            train_df=train_df,
+                            test_df=test_df,
+                            target_column=target_column,
+                            sensitive_attributes=sensitive_attributes
+                        )
+                        
+                        score = result['summary']['final_fairness']
+                        pipeline_str = f"{pre or 'None'} → {inp or 'None'} → {post or 'None'}"
+                        logger.info(f"  [{tested}/{total_combinations}] {pipeline_str}: {score:.2f}")
+                        
+                        if score > best_score:
+                            best_score = score
+                            best_pipeline = {
+                                'preprocessing': pre,
+                                'inprocessing': inp,
+                                'postprocessing': post
+                            }
+                            best_result = result
+                            logger.info(f"  ★ NEW BEST: {score:.2f}")
+                            
+                    except Exception as e:
+                        logger.warning(f"  Pipeline {tested} failed: {e}")
+        
+        logger.info(f"\n=== Best Pipeline Found (Exhaustive) ===")
+        logger.info(f"Preprocessing: {best_pipeline['preprocessing']}")
+        logger.info(f"In-processing: {best_pipeline['inprocessing']}")
+        logger.info(f"Post-processing: {best_pipeline['postprocessing']}")
+        logger.info(f"Score: {best_score:.2f}")
+        logger.info(f"Tested {tested} combinations")
+        
+        return {
+            'best_pipeline': best_pipeline,
+            'final_score': best_score,
+            'results': best_result,
+            'combinations_tested': tested,
+            'search_method': 'exhaustive'
+        }

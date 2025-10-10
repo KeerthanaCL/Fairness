@@ -240,6 +240,58 @@ const APIServiceStatus = () => {
           Production deployments should use environment variables.
         </p>
       </div>
+      {/* Configuration Test Section */}
+      <div className="border-t border-gray-200 dark:border-gray-700 my-6"></div>
+
+      <h3 className="text-sm font-medium text-gray-900 dark:text-gray-100 mb-4">
+        Configuration Endpoints Test
+      </h3>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <button
+          onClick={async () => {
+            try {
+              const attrs = await FairnessAPIService.getAvailableSensitiveAttributes();
+              setTestResults({
+                success: true,
+                message: `Loaded ${attrs.attributes?.length || 0} sensitive attributes`,
+                timestamp: new Date().toLocaleTimeString(),
+              });
+            } catch (err) {
+              setTestResults({
+                success: false,
+                error: err.message,
+                timestamp: new Date().toLocaleTimeString(),
+              });
+            }
+          }}
+          className="px-3 py-2 text-sm font-medium border border-gray-300 dark:border-gray-600 rounded-md text-gray-700 dark:text-gray-300 bg-white dark:bg-gray-800 hover:bg-gray-50 dark:hover:bg-gray-700"
+        >
+          Test Sensitive Attributes
+        </button>
+
+        <button
+          onClick={async () => {
+            try {
+              const opts = await FairnessAPIService.getMitigationOptions();
+              setTestResults({
+                success: true,
+                message: `Loaded ${opts.options?.length || 0} mitigation options`,
+                timestamp: new Date().toLocaleTimeString(),
+              });
+            } catch (err) {
+              setTestResults({
+                success: false,
+                error: err.message,
+                timestamp: new Date().toLocaleTimeString(),
+              });
+            }
+          }}
+          className="px-3 py-2 text-sm font-medium border border-gray-300 dark:border-gray-600 rounded-md text-gray-700 dark:text-gray-300 bg-white dark:bg-gray-800 hover:bg-gray-50 dark:hover:bg-gray-700"
+        >
+          Test Mitigation Options
+        </button>
+      </div>
     </div>
   );
 };

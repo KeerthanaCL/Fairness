@@ -21,7 +21,7 @@ class TestType(str, Enum):
     ANOVA = "ANOVA"
     T_TEST = "T-Test"
     PEARSON = "Pearson"
-
+    HSIC = "HSIC/NOCCO"  # ADD THIS LINE
 
 class EffectSizeLabel(str, Enum):
     """Effect size classifications"""
