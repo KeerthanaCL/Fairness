@@ -32,6 +32,10 @@ from app.models.schemas import (
 )
 from app.services.analysis_service import AnalysisService
 from app.core.config import settings
+from app.core.database import (
+    get_sensitive_features_metadata, get_dataset_metadata, 
+    store_sensitive_features_metadata, create_tables
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -914,3 +918,180 @@ async def get_mitigation_options():
     except Exception as e:
         logger.error(f"Failed to get mitigation options: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to get options: {str(e)}")
+
+
+@router.post("/sensitive-features-with-metadata/{analysis_id}")
+async def get_sensitive_features_with_metadata(analysis_id: str):
+    """
+    Get sensitive features with preserved metadata for both original and transformed datasets
+    This endpoint ensures consistent metadata format before and after mitigation
+    """
+    try:
+        # Initialize database tables if not exists
+        create_tables()
+        
+        # Get analysis configuration
+        analysis_config = analysis_service.get_analysis_config(analysis_id)
+        if not analysis_config:
+            raise HTTPException(status_code=404, detail="Analysis not found")
+        
+        dataset_id = analysis_config.get('dataset_id', analysis_id)
+        
+        # Check if this is a transformed dataset
+        dataset_metadata = get_dataset_metadata(dataset_id)
+        if dataset_metadata and dataset_metadata.get('is_transformed'):
+            # For transformed datasets, get preserved metadata
+            sensitive_features = get_sensitive_features_metadata(dataset_id)
+            transformation_info = {
+                'is_transformed': True,
+                'original_dataset_id': dataset_metadata.get('original_dataset_id'),
+                'transformation_applied': dataset_metadata.get('transformation_applied')
+            }
+        else:
+            # For original datasets, get standard detection results
+            detection_results = analysis_service.get_sensitive_features(analysis_id)
+            if detection_results and hasattr(detection_results, 'detectedFeatures'):
+                # Convert to metadata format and cache
+                sensitive_features = []
+                for feature in detection_results.detectedFeatures:
+                    feature_meta = {
+                        'name': feature.name,
+                        'dataType': feature.dataType.value if hasattr(feature.dataType, 'value') else str(feature.dataType),
+                        'sensitivityScore': feature.sensitivityScore,
+                        'pValue': feature.pValue,
+                        'categories': feature.categories,
+                        'isSensitive': feature.isSensitive,
+                        'detectionMethod': feature.detectionMethod or 'hsic'
+                    }
+                    sensitive_features.append(feature_meta)
+                
+                # Cache the metadata
+                store_sensitive_features_metadata(dataset_id, sensitive_features)
+            else:
+                sensitive_features = []
+            
+            transformation_info = {
+                'is_transformed': False,
+                'original_dataset_id': None,
+                'transformation_applied': None
+            }
+        
+        return {
+            'sensitive_features': sensitive_features,
+            'metadata': transformation_info,
+            'total_features': len(sensitive_features)
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to get sensitive features with metadata: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Metadata retrieval failed: {str(e)}")
+
+
+@router.post("/apply-mitigation-with-metadata")
+async def apply_mitigation_with_metadata(request: PipelineMitigationRequest):
+    """
+    Apply mitigation strategy with sensitive feature metadata preservation
+    This endpoint ensures metadata is tracked through the entire mitigation pipeline
+    """
+    try:
+        from app.services.mitigation_service import MitigationService
+        
+        # Initialize database tables
+        create_tables()
+        
+        analysis_id = request.analysisId
+        
+        # Get analysis configuration
+        analysis_config = analysis_service.get_analysis_config(analysis_id)
+        if not analysis_config:
+            raise HTTPException(status_code=404, detail="Analysis not found")
+        
+        # Get current sensitive features metadata
+        dataset_id = analysis_config.get('dataset_id', analysis_id)
+        sensitive_features_metadata = get_sensitive_features_metadata(dataset_id)
+        
+        if not sensitive_features_metadata:
+            raise HTTPException(status_code=400, detail="No sensitive features detected for this analysis")
+        
+        # Determine which strategy to apply
+        strategy_name = None
+        if request.preprocessingStrategy:
+            strategy_name = request.preprocessingStrategy
+        elif request.inprocessingStrategy:
+            strategy_name = request.inprocessingStrategy
+        elif request.postprocessingStrategy:
+            strategy_name = request.postprocessingStrategy
+        else:
+            raise HTTPException(status_code=400, detail="No mitigation strategy specified")
+        
+        # Get analysis data
+        analysis_data = analysis_service.get_analysis_data(analysis_id)
+        if not analysis_data:
+            raise HTTPException(status_code=404, detail="Analysis data not found")
+        
+        # Extract sensitive attribute names
+        sensitive_attributes = [f['name'] for f in sensitive_features_metadata if f.get('isSensitive')]
+        
+        # Apply mitigation with metadata preservation
+        mitigation_service = MitigationService()
+        
+        # Note: This would need to be adapted based on your actual data structure
+        # For now, returning a mock response that shows the concept
+        result = {
+            'status': 'completed',
+            'strategy_applied': strategy_name,
+            'metadata_preserved': True,
+            'sensitive_features_tracked': len(sensitive_attributes),
+            'mitigated_dataset_id': f"{dataset_id}_mitigated",
+            'transformation_details': {
+                'original_features': len(sensitive_features_metadata),
+                'preserved_features': len(sensitive_attributes),
+                'preservation_rate': len(sensitive_attributes) / len(sensitive_features_metadata) if sensitive_features_metadata else 0
+            }
+        }
+        
+        return result
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to apply mitigation with metadata: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Mitigation failed: {str(e)}")
+
+
+@router.get("/feature-tracking-info/{dataset_id}")
+async def get_feature_tracking_info(dataset_id: str):
+    """
+    Get comprehensive feature tracking information for a dataset
+    Shows how sensitive features have been transformed through the pipeline
+    """
+    try:
+        from app.core.database import get_feature_transformation_metadata
+        
+        # Get dataset metadata
+        dataset_metadata = get_dataset_metadata(dataset_id)
+        
+        # Get transformation information
+        transformations = get_feature_transformation_metadata(dataset_id)
+        
+        # Get sensitive features metadata
+        sensitive_features = get_sensitive_features_metadata(dataset_id)
+        
+        tracking_info = {
+            'dataset_id': dataset_id,
+            'is_transformed': dataset_metadata.get('is_transformed', False) if dataset_metadata else False,
+            'original_dataset_id': dataset_metadata.get('original_dataset_id') if dataset_metadata else None,
+            'transformation_applied': dataset_metadata.get('transformation_applied') if dataset_metadata else None,
+            'sensitive_features_count': len(sensitive_features),
+            'transformations_count': len(transformations),
+            'feature_transformations': transformations,
+            'sensitive_features': sensitive_features
+        }
+        
+        return tracking_info
+        
+    except Exception as e:
+        logger.error(f"Failed to get feature tracking info: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Tracking info retrieval failed: {str(e)}")

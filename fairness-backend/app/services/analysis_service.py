@@ -18,6 +18,11 @@ from app.core.data_processor import DataProcessor
 from app.core.bias_detector import BiasDetector
 from app.core.fairness_metrics import FairnessMetricsCalculator
 from app.utils.file_handler import FileHandler
+from app.services.mitigation_service import MitigationService
+from app.core.database import (
+    get_sensitive_features_metadata, store_sensitive_features_metadata,
+    get_dataset_metadata, create_tables
+)
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +40,7 @@ class AnalysisService:
             cls._instance.bias_detector = BiasDetector()
             cls._instance.fairness_metrics = FairnessMetricsCalculator()
             cls._instance.file_handler = FileHandler()
+            cls._instance.mitigation_service = MitigationService()
             logger.info("Created new AnalysisService singleton instance")
         else:
             logger.info("Returning existing AnalysisService singleton instance")
@@ -984,6 +990,103 @@ class AnalysisService:
                     else:
                         # Take first 6 and add indicator for more
                         return groups[:6] + [f"... +{len(groups)-6} more"]
+        
+        # Return empty list if attribute not found
+        logger.warning(f"Attribute {attribute_name} not found in detected features")
+        return []
+    
+    def apply_mitigation_with_metadata_preservation(
+        self, 
+        analysis_id: str, 
+        strategy_name: str
+    ) -> Dict[str, Any]:
+        """Apply mitigation strategy while preserving sensitive feature metadata"""
+        
+        try:
+            # Initialize database
+            create_tables()
+            
+            if analysis_id not in self.analyses:
+                raise ValueError(f"Analysis {analysis_id} not found")
+            
+            analysis = self.analyses[analysis_id]
+            results = analysis.get("results", {})
+            
+            # Get analysis data
+            training_data = results.get("training_data")
+            testing_data = results.get("testing_data")
+            model = results.get("model")
+            target_column = analysis["request"].target_column
+            
+            if not all([training_data is not None, testing_data is not None, model is not None]):
+                raise ValueError("Required analysis data not found")
+            
+            # Get sensitive features from detection results
+            detection_result = results.get("sensitive_features")
+            if not detection_result or not hasattr(detection_result, 'detectedFeatures'):
+                raise ValueError("Sensitive feature detection results not found")
+            
+            # Extract sensitive feature names
+            sensitive_attributes = [f.name for f in detection_result.detectedFeatures 
+                                  if f.sensitivityLevel in ['Highly Sensitive', 'Moderately Sensitive']]
+            
+            if not sensitive_attributes:
+                raise ValueError("No sensitive attributes found for mitigation")
+            
+            # Convert detection results to metadata format for preservation
+            original_features_metadata = []
+            for feature in detection_result.detectedFeatures:
+                feature_meta = {
+                    'name': feature.name,
+                    'dataType': feature.dataType.value if hasattr(feature.dataType, 'value') else str(feature.dataType),
+                    'sensitivityScore': feature.effectSize,
+                    'pValue': feature.pValue,
+                    'categories': feature.groups,
+                    'isSensitive': feature.sensitivityLevel in ['Highly Sensitive', 'Moderately Sensitive'],
+                    'detectionMethod': feature.test.value if hasattr(feature.test, 'value') else str(feature.test)
+                }
+                original_features_metadata.append(feature_meta)
+            
+            # Apply mitigation with metadata preservation
+            mitigation_result = self.mitigation_service.apply_mitigation_strategy_with_metadata_preservation(
+                strategy_name=strategy_name,
+                model=model,
+                train_df=training_data,
+                test_df=testing_data,
+                target_column=target_column,
+                sensitive_attributes=sensitive_attributes,
+                dataset_id=analysis_id,
+                original_sensitive_features_metadata=original_features_metadata
+            )
+            
+            # Store the result in analysis
+            analysis["results"]["mitigation_with_metadata"] = mitigation_result
+            
+            return mitigation_result
+            
+        except Exception as e:
+            logger.error(f"Failed to apply mitigation with metadata preservation: {str(e)}")
+            raise
+    
+    def get_analysis_config(self, analysis_id: str) -> Optional[Dict]:
+        """Get analysis configuration for metadata operations"""
+        if analysis_id not in self.analyses:
+            return None
+        
+        analysis = self.analyses[analysis_id]
+        return {
+            'dataset_id': analysis_id,
+            'target_column': analysis["request"].target_column,
+            'status': analysis["status"],
+            'request': analysis["request"]
+        }
+    
+    def get_analysis_data(self, analysis_id: str) -> Optional[Dict]:
+        """Get analysis data for mitigation operations"""
+        if analysis_id not in self.analyses:
+            return None
+        
+        return self.analyses[analysis_id].get("results", {})
         
         # Fallback if attribute not found
         logger.warning(f"Attribute {attribute_name} not found in detected features")

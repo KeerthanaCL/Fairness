@@ -11,7 +11,7 @@ import os
 from pathlib import Path
 
 from app.api import upload, analysis, config, explanations
-# from app.core.database import init_db  # Temporarily disabled for in-memory storage
+from app.core.database import init_db, create_tables
 from app.core.config import settings
 
 # Initialize FastAPI app
@@ -47,7 +47,8 @@ app.include_router(explanations.router, prefix="/api/explanations", tags=["AI Ex
 @app.on_event("startup")
 async def startup_event():
     """Initialize database and create necessary directories on startup"""
-    # await init_db()  # Temporarily disabled for in-memory storage
+    await init_db()
+    create_tables()  # Create our custom tables for metadata tracking
     
     # Create upload directories
     for directory in ["uploads/datasets", "uploads/models", "uploads/temp"]:

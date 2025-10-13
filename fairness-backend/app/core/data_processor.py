@@ -1,6 +1,7 @@
 """
 Data processing utilities for fairness analysis
 Enhanced version adapted from backend_old with improved error handling
+Enhanced with metadata preservation capabilities
 """
 
 import pandas as pd
@@ -11,8 +12,13 @@ from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple, Union
 import logging
 from sklearn.base import BaseEstimator
+import uuid
 
 from app.core.config import settings
+from app.core.database import (
+    store_dataset_metadata, get_dataset_metadata,
+    store_sensitive_features_metadata, get_sensitive_features_metadata
+)
 
 logger = logging.getLogger(__name__)
 
@@ -29,9 +35,10 @@ class DataProcessor:
             '.parquet': self._load_parquet
         }
         
-    def load_dataset(self, file_path: Union[str, Path]) -> pd.DataFrame:
+    def load_dataset(self, file_path: Union[str, Path], dataset_id: str = None) -> pd.DataFrame:
         """
         Load dataset from various formats with robust error handling
+        Enhanced with metadata tracking
         """
         file_path = Path(file_path)
         
@@ -50,12 +57,138 @@ class DataProcessor:
             if df.empty:
                 raise ValueError("Dataset is empty")
             
+            # Generate dataset_id if not provided
+            if not dataset_id:
+                dataset_id = str(uuid.uuid4())
+            
+            # Store dataset metadata
+            store_dataset_metadata(
+                dataset_id=dataset_id,
+                is_transformed=False,
+                columns=list(df.columns)
+            )
+            
             logger.info(f"Successfully loaded dataset: {file_path.name} with shape {df.shape}")
             return df
             
         except Exception as e:
             logger.error(f"Failed to load dataset {file_path}: {str(e)}")
             raise
+    
+    def save_dataset_with_metadata(
+        self, 
+        df: pd.DataFrame, 
+        file_path: Union[str, Path], 
+        dataset_id: str,
+        original_dataset_id: str = None,
+        transformation_applied: str = None,
+        preserve_metadata: bool = True
+    ) -> str:
+        """
+        Save dataset with metadata preservation
+        
+        Args:
+            df: DataFrame to save
+            file_path: Path to save the dataset
+            dataset_id: Unique identifier for this dataset
+            original_dataset_id: ID of the original dataset (if this is a transformation)
+            transformation_applied: Description of transformation applied
+            preserve_metadata: Whether to preserve sensitive feature metadata
+            
+        Returns:
+            Dataset ID of the saved dataset
+        """
+        file_path = Path(file_path)
+        
+        try:
+            # Save the dataset
+            if file_path.suffix.lower() == '.csv':
+                df.to_csv(file_path, index=False)
+            elif file_path.suffix.lower() == '.parquet':
+                df.to_parquet(file_path, index=False)
+            elif file_path.suffix.lower() == '.pickle':
+                df.to_pickle(file_path)
+            else:
+                # Default to CSV
+                file_path = file_path.with_suffix('.csv')
+                df.to_csv(file_path, index=False)
+            
+            # Store dataset metadata
+            store_dataset_metadata(
+                dataset_id=dataset_id,
+                original_dataset_id=original_dataset_id,
+                is_transformed=original_dataset_id is not None,
+                transformation_applied=transformation_applied,
+                columns=list(df.columns)
+            )
+            
+            # Preserve sensitive features metadata if requested and available
+            if preserve_metadata and original_dataset_id:
+                self._preserve_sensitive_features_metadata(
+                    original_dataset_id, dataset_id, df.columns
+                )
+            
+            logger.info(f"Successfully saved dataset with metadata: {file_path}")
+            return dataset_id
+            
+        except Exception as e:
+            logger.error(f"Failed to save dataset with metadata: {str(e)}")
+            raise
+    
+    def _preserve_sensitive_features_metadata(
+        self, 
+        original_dataset_id: str, 
+        new_dataset_id: str, 
+        current_columns: List[str]
+    ):
+        """Preserve sensitive features metadata from original dataset"""
+        
+        # Get original sensitive features metadata
+        original_features = get_sensitive_features_metadata(original_dataset_id)
+        
+        if not original_features:
+            return
+        
+        # Filter features that still exist in the transformed dataset
+        preserved_features = []
+        current_columns_set = set(current_columns)
+        
+        for feature_meta in original_features:
+            if feature_meta['name'] in current_columns_set:
+                # Feature still exists, preserve its metadata
+                preserved_feature = feature_meta.copy()
+                preserved_feature['transformation_preserved'] = True
+                preserved_features.append(preserved_feature)
+            else:
+                logger.warning(f"Sensitive feature {feature_meta['name']} not found in transformed dataset")
+        
+        # Store preserved metadata for the new dataset
+        if preserved_features:
+            store_sensitive_features_metadata(new_dataset_id, preserved_features)
+            logger.info(f"Preserved metadata for {len(preserved_features)} sensitive features")
+    
+    def get_dataset_with_metadata(self, dataset_id: str) -> Tuple[Optional[pd.DataFrame], Dict]:
+        """
+        Get dataset along with its metadata
+        
+        Returns:
+            Tuple of (DataFrame, metadata_dict)
+        """
+        try:
+            # Get dataset metadata
+            metadata = get_dataset_metadata(dataset_id)
+            
+            if not metadata:
+                logger.warning(f"No metadata found for dataset {dataset_id}")
+                return None, {}
+            
+            # Try to load the dataset (this would need to be adapted based on how you store datasets)
+            # For now, return the metadata
+            return None, metadata
+            
+        except Exception as e:
+            logger.error(f"Failed to get dataset with metadata: {str(e)}")
+            return None, {}
     
     def _load_csv(self, file_path: Path) -> pd.DataFrame:
         """Load CSV file with automatic encoding detection"""

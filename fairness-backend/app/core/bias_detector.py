@@ -1,6 +1,7 @@
 """
 Bias detection module adapted from backend_old with FastAPI integration
 Performs statistical tests to identify sensitive features
+Enhanced with transformation-aware detection and metadata preservation
 """
 
 import pandas as pd
@@ -13,6 +14,10 @@ import logging
 from app.models.schemas import (
     SensitiveFeature, SensitiveFeatureSummary, SensitiveFeatureDetectionResponse,
     DataType, TestType, EffectSizeLabel, SensitivityLevel, RiskLevel
+)
+from app.core.database import (
+    get_sensitive_features_metadata, get_feature_transformation_metadata,
+    get_dataset_metadata, store_sensitive_features_metadata
 )
 
 logger = logging.getLogger(__name__)
@@ -34,14 +39,24 @@ class BiasDetector:
         df: pd.DataFrame, 
         target_column: str, 
         feature_types: Dict[str, str],
-        exclude_columns: Optional[List[str]] = None
+        exclude_columns: Optional[List[str]] = None,
+        dataset_id: Optional[str] = None,
+        use_cached: bool = True
     ) -> SensitiveFeatureDetectionResponse:
         """
         Main method to detect sensitive features using HSIC/NOCCO approach and statistical tests
+        Enhanced with transformation awareness and metadata caching
         """
         exclude_columns = exclude_columns or []
         
         try:
+            # Check if this dataset has cached metadata or transformations
+            if dataset_id and use_cached:
+                cached_result = self._try_get_cached_detection(dataset_id, df, target_column)
+                if cached_result:
+                    logger.info(f"Using cached sensitive feature detection for dataset {dataset_id}")
+                    return cached_result
+            
             if self.use_hsic:
                 # Perform HSIC/NOCCO analysis for sensitive feature detection
                 statistical_results = self._perform_hsic_analysis(
@@ -59,6 +74,10 @@ class BiasDetector:
             # Generate summary
             summary = self._generate_summary(detected_features)
             
+            # Cache results if dataset_id provided
+            if dataset_id:
+                self._cache_detection_results(dataset_id, detected_features)
+            
             logger.info(f"Bias detection completed. Found {len(detected_features)} sensitive features")
             
             return SensitiveFeatureDetectionResponse(
@@ -69,6 +88,223 @@ class BiasDetector:
         except Exception as e:
             logger.error(f"Bias detection failed: {str(e)}", exc_info=True)
             raise
+    
+    def _try_get_cached_detection(
+        self, 
+        dataset_id: str, 
+        df: pd.DataFrame, 
+        target_column: str
+    ) -> Optional[SensitiveFeatureDetectionResponse]:
+        """Try to get cached sensitive feature detection results"""
+        
+        # Check if this is a transformed dataset
+        dataset_metadata = get_dataset_metadata(dataset_id)
+        if dataset_metadata and dataset_metadata.get('is_transformed'):
+            # For transformed datasets, use transformation mapping
+            return self._get_transformed_features_detection(dataset_id, df, target_column)
+        
+        # Check for direct cached results
+        cached_features = get_sensitive_features_metadata(dataset_id)
+        if cached_features:
+            # Verify that cached features still exist in current dataset
+            current_columns = set(df.columns)
+            valid_cached_features = [
+                f for f in cached_features 
+                if f['name'] in current_columns
+            ]
+            
+            if valid_cached_features:
+                # Convert cached results to response format
+                detected_features = self._convert_cached_to_response_format(valid_cached_features)
+                summary = self._generate_summary(detected_features)
+                
+                return SensitiveFeatureDetectionResponse(
+                    detectedFeatures=detected_features,
+                    summary=summary
+                )
+        
+        return None
+    
+    def _get_transformed_features_detection(
+        self, 
+        dataset_id: str, 
+        df: pd.DataFrame, 
+        target_column: str
+    ) -> Optional[SensitiveFeatureDetectionResponse]:
+        """Get sensitive feature detection for transformed datasets"""
+        
+        # Get transformation metadata
+        transformations = get_feature_transformation_metadata(dataset_id)
+        dataset_metadata = get_dataset_metadata(dataset_id)
+        
+        if not dataset_metadata:
+            logger.warning(f"No dataset metadata found for {dataset_id}")
+            return None
+        
+        original_dataset_id = dataset_metadata.get('original_dataset_id')
+        if not original_dataset_id:
+            logger.warning(f"No original dataset ID found for transformed dataset {dataset_id}")
+            return None
+        
+        # Get original sensitive features
+        original_features = get_sensitive_features_metadata(original_dataset_id)
+        if not original_features:
+            logger.warning(f"No original sensitive features found for {original_dataset_id}")
+            return None
+        
+        # Map original features to transformed features
+        transformed_features = []
+        current_columns = set(df.columns)
+        
+        logger.info(f"Processing {len(original_features)} original features for transformation mapping")
+        logger.info(f"Available transformations: {transformations}")
+        logger.info(f"Current dataset columns: {list(current_columns)}")
+        
+        for original_feature in original_features:
+            original_name = original_feature['name']
+            logger.info(f"Processing original feature: {original_name}")
+            
+            # Check if feature was explicitly transformed
+            if transformations and original_name in transformations:
+                transformed_name = transformations[original_name]['transformed_feature']
+                logger.info(f"Found transformation: {original_name} -> {transformed_name}")
+                
+                if transformed_name in current_columns:
+                    # Create updated feature metadata
+                    transformed_feature = original_feature.copy()
+                    transformed_feature['name'] = transformed_name
+                    transformed_feature['transformation_applied'] = transformations[original_name]['transformation_type']
+                    transformed_features.append(transformed_feature)
+                    logger.info(f"Added transformed feature: {transformed_name}")
+                else:
+                    logger.warning(f"Transformed feature {transformed_name} not found in current columns")
+            elif original_name in current_columns:
+                # Feature preserved without explicit transformation
+                transformed_feature = original_feature.copy()
+                transformed_feature['transformation_applied'] = 'preserved'
+                transformed_features.append(transformed_feature)
+                logger.info(f"Added preserved feature: {original_name}")
+            else:
+                logger.warning(f"Feature {original_name} not found in current dataset - may have been removed")
+        
+        logger.info(f"Final transformed features count: {len(transformed_features)}")
+        
+        if transformed_features:
+            # Cache the transformed features for this dataset
+            store_sensitive_features_metadata(dataset_id, transformed_features)
+            
+            # Convert to response format
+            detected_features = self._convert_cached_to_response_format(transformed_features)
+            summary = self._generate_summary(detected_features)
+            
+            return SensitiveFeatureDetectionResponse(
+                detectedFeatures=detected_features,
+                summary=summary
+            )
+        
+        logger.warning("No transformed features could be mapped")
+        return None
+    
+    def _convert_cached_to_response_format(self, cached_features: List[Dict]) -> List[SensitiveFeature]:
+        """Convert cached feature metadata to SensitiveFeature objects"""
+        
+        detected_features = []
+        for feature_meta in cached_features:
+            try:
+                sensitivity_score = feature_meta.get('sensitivity_score', feature_meta.get('sensitivityScore', 0.0))
+                p_value = feature_meta.get('p_value', feature_meta.get('pValue', 1.0))
+                categories = feature_meta.get('categories', [])
+                is_sensitive = feature_meta.get('is_sensitive', feature_meta.get('isSensitive', False))
+                detection_method = feature_meta.get('detection_method', feature_meta.get('detectionMethod', 'hsic'))
+                
+                # Map test type correctly with proper enum values
+                test_type_mapping = {
+                    'hsic': TestType.HSIC,
+                    'chi_square': TestType.CHI_SQUARE,
+                    'anova': TestType.ANOVA,
+                    't_test': TestType.T_TEST,
+                    'pearson': TestType.PEARSON,
+                    'cached': TestType.HSIC  # Default for cached features
+                }
+                
+                test_type = test_type_mapping.get(detection_method.lower(), TestType.HSIC)
+                
+                # Determine sensitivity level based on p-value and effect size
+                if is_sensitive and p_value < 0.01 and sensitivity_score > 0.8:
+                    sensitivity_level = SensitivityLevel.HIGHLY_SENSITIVE
+                elif is_sensitive and p_value < 0.05 and sensitivity_score > 0.5:
+                    sensitivity_level = SensitivityLevel.MODERATELY_SENSITIVE
+                else:
+                    sensitivity_level = SensitivityLevel.LOW_SENSITIVITY
+                
+                # Determine effect size label
+                if sensitivity_score > 0.8:
+                    effect_size_label = EffectSizeLabel.LARGE
+                elif sensitivity_score > 0.5:
+                    effect_size_label = EffectSizeLabel.MEDIUM
+                else:
+                    effect_size_label = EffectSizeLabel.SMALL
+                
+                # Determine data type
+                data_type_str = feature_meta.get('feature_type', feature_meta.get('dataType', 'categorical'))
+                if data_type_str.lower() == 'numerical':
+                    data_type = DataType.NUMERICAL
+                elif data_type_str.lower() == 'binary':
+                    data_type = DataType.BINARY
+                else:
+                    data_type = DataType.CATEGORICAL
+                
+                sensitive_feature = SensitiveFeature(
+                    name=feature_meta['name'],
+                    dataType=data_type,
+                    test=test_type,
+                    pValue=p_value,
+                    effectSize=sensitivity_score,
+                    effectSizeLabel=effect_size_label,
+                    correlation=sensitivity_score,  # Use effect size as correlation
+                    sensitivityLevel=sensitivity_level,
+                    groups=categories,
+                    description=f"Cached sensitive feature: {feature_meta['name']}"
+                )
+                detected_features.append(sensitive_feature)
+                
+            except Exception as e:
+                logger.warning(f"Failed to convert cached feature {feature_meta.get('name')}: {e}")
+                continue
+        
+        return detected_features
+    
+    def _cache_detection_results(self, dataset_id: str, detected_features: List[SensitiveFeature]):
+        """Cache detection results for future use"""
+        
+        features_metadata = []
+        for feature in detected_features:
+            # Convert test type enum to string properly
+            test_type_str = feature.test.value if hasattr(feature.test, 'value') else str(feature.test)
+            
+            # Map enum values to storage-friendly names
+            test_type_mapping = {
+                'HSIC/NOCCO': 'hsic',
+                'Chi-Square': 'chi_square',
+                'ANOVA': 'anova',
+                'T-Test': 't_test',
+                'Pearson': 'pearson'
+            }
+            
+            detection_method = test_type_mapping.get(test_type_str, 'hsic')
+            
+            feature_meta = {
+                'name': feature.name,
+                'dataType': feature.dataType.value if hasattr(feature.dataType, 'value') else str(feature.dataType),
+                'sensitivityScore': feature.effectSize,  # Use effectSize as sensitivity score
+                'pValue': feature.pValue,
+                'categories': feature.groups,  # Use groups as categories
+                'isSensitive': feature.sensitivityLevel in [SensitivityLevel.HIGHLY_SENSITIVE, SensitivityLevel.MODERATELY_SENSITIVE],
+                'detectionMethod': detection_method
+            }
+            features_metadata.append(feature_meta)
+        
+        store_sensitive_features_metadata(dataset_id, features_metadata)
     
     def _perform_hsic_analysis(
         self, 
