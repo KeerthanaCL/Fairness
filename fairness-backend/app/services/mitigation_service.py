@@ -1,11 +1,13 @@
 """
 Real Mitigation Service - Implements actual bias mitigation strategies
 This service applies real mitigation techniques instead of simulations
+Enhanced with sensitive feature metadata preservation
 """
 
 import logging
 import numpy as np
 import pandas as pd
+import uuid
 from typing import Dict, Any, List, Optional, Tuple
 from sklearn.base import BaseEstimator, clone
 from sklearn.model_selection import cross_val_score
@@ -19,6 +21,11 @@ from app.models.schemas import (
     FairnessComparisonMetrics, PerformanceMetrics, GroupComparison
 )
 from app.core.fairness_metrics import FairnessMetricsCalculator
+from app.core.database import (
+    store_feature_transformation, get_feature_transformation_metadata,
+    store_sensitive_features_metadata, get_sensitive_features_metadata,
+    store_dataset_metadata, get_dataset_metadata
+)
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +42,197 @@ class MitigationService:
     
     def __init__(self):
         self.fairness_calculator = FairnessMetricsCalculator()
+        
+    def apply_mitigation_strategy_with_metadata_preservation(
+        self, 
+        strategy_name: str,
+        model: BaseEstimator,
+        train_df: pd.DataFrame,
+        test_df: pd.DataFrame,
+        target_column: str,
+        sensitive_attributes: List[str],
+        dataset_id: str,
+        original_sensitive_features_metadata: List[Dict] = None
+    ) -> Dict[str, Any]:
+        """
+        Apply mitigation strategy while preserving sensitive feature metadata
+        
+        Args:
+            strategy_name: Name of the mitigation strategy
+            model: ML model to apply mitigation to
+            train_df: Training dataset
+            test_df: Test dataset
+            target_column: Target column name
+            sensitive_attributes: List of sensitive attribute names
+            dataset_id: Unique identifier for the dataset
+            original_sensitive_features_metadata: Original metadata for sensitive features
+        
+        Returns:
+            Dict containing mitigation results with preserved metadata
+        """
+        logger.info(f"Applying mitigation strategy: {strategy_name} with metadata preservation")
+        
+        try:
+            # Generate new dataset ID for mitigated version
+            mitigated_dataset_id = f"{dataset_id}_mitigated_{str(uuid.uuid4())[:8]}"
+            
+            # Store original sensitive features metadata if provided
+            if original_sensitive_features_metadata:
+                store_sensitive_features_metadata(dataset_id, original_sensitive_features_metadata)
+            
+            # Calculate baseline (before) metrics
+            before_results = self._calculate_baseline_metrics(
+                model, test_df, target_column, sensitive_attributes
+            )
+            
+            # Apply the mitigation strategy
+            result = self.apply_mitigation_strategy(
+                strategy_name, model, train_df, test_df, target_column, sensitive_attributes
+            )
+            
+            # Preserve feature metadata after transformation
+            self._preserve_feature_metadata_after_mitigation(
+                dataset_id, mitigated_dataset_id, strategy_name, 
+                sensitive_attributes, train_df, test_df, target_column
+            )
+            
+            # Store dataset metadata
+            store_dataset_metadata(
+                mitigated_dataset_id, 
+                original_dataset_id=dataset_id,
+                is_transformed=True,
+                transformation_applied=strategy_name,
+                columns=list(test_df.columns),
+                target_column=target_column
+            )
+            
+            # Enhance result with metadata preservation info
+            result['mitigated_dataset_id'] = mitigated_dataset_id
+            result['metadata_preserved'] = True
+            result['sensitive_features_tracking'] = self._get_feature_tracking_info(
+                dataset_id, mitigated_dataset_id
+            )
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Mitigation with metadata preservation failed for {strategy_name}: {str(e)}")
+            raise
+    
+    def _preserve_feature_metadata_after_mitigation(
+        self,
+        original_dataset_id: str,
+        mitigated_dataset_id: str, 
+        strategy_name: str,
+        sensitive_attributes: List[str],
+        train_df: pd.DataFrame,
+        test_df: pd.DataFrame,
+        target_column: str
+    ):
+        """Preserve sensitive feature metadata after mitigation transformation"""
+        
+        # Get original sensitive features metadata
+        original_metadata = get_sensitive_features_metadata(original_dataset_id)
+        
+        # Track feature transformations
+        for feature in sensitive_attributes:
+            if feature in test_df.columns:
+                # Feature still exists after transformation
+                store_feature_transformation(
+                    mitigated_dataset_id,
+                    original_feature=feature,
+                    transformed_feature=feature,
+                    transformation_type=strategy_name,
+                    metadata={
+                        'preserves_original': True,
+                        'transformation_details': f'Applied {strategy_name} mitigation'
+                    }
+                )
+                
+                # Copy original metadata for preserved features
+                original_feature_meta = next(
+                    (meta for meta in original_metadata if meta['name'] == feature), 
+                    None
+                )
+                if original_feature_meta:
+                    # Store updated metadata for mitigated dataset
+                    mitigated_metadata = original_feature_meta.copy()
+                    mitigated_metadata['transformation_applied'] = strategy_name
+                    store_sensitive_features_metadata(mitigated_dataset_id, [mitigated_metadata])
+            else:
+                # Feature was transformed or removed
+                logger.warning(f"Feature {feature} not found after {strategy_name} mitigation")
+                # Try to find transformed version
+                self._handle_transformed_feature(
+                    original_dataset_id, mitigated_dataset_id, feature, 
+                    strategy_name, test_df.columns
+                )
+    
+    def _handle_transformed_feature(
+        self,
+        original_dataset_id: str,
+        mitigated_dataset_id: str,
+        original_feature: str,
+        strategy_name: str,
+        current_columns: List[str]
+    ):
+        """Handle features that were transformed during mitigation"""
+        
+        # Common feature name patterns after transformation
+        possible_transformed_names = [
+            f"{original_feature}_transformed",
+            f"{original_feature}_mitigated", 
+            f"fair_{original_feature}",
+            f"{original_feature}_adjusted"
+        ]
+        
+        transformed_feature = None
+        for possible_name in possible_transformed_names:
+            if possible_name in current_columns:
+                transformed_feature = possible_name
+                break
+        
+        if transformed_feature:
+            # Store transformation mapping
+            store_feature_transformation(
+                mitigated_dataset_id,
+                original_feature=original_feature,
+                transformed_feature=transformed_feature,
+                transformation_type=strategy_name,
+                metadata={
+                    'preserves_original': False,
+                    'transformation_details': f'Feature renamed during {strategy_name} mitigation'
+                }
+            )
+            
+            # Get and update metadata for transformed feature
+            original_metadata = get_sensitive_features_metadata(original_dataset_id)
+            original_feature_meta = next(
+                (meta for meta in original_metadata if meta['name'] == original_feature), 
+                None
+            )
+            
+            if original_feature_meta:
+                transformed_metadata = original_feature_meta.copy()
+                transformed_metadata['name'] = transformed_feature
+                transformed_metadata['transformation_applied'] = strategy_name
+                store_sensitive_features_metadata(mitigated_dataset_id, [transformed_metadata])
+        else:
+            logger.warning(f"Could not find transformed version of feature {original_feature}")
+    
+    def _get_feature_tracking_info(self, original_dataset_id: str, mitigated_dataset_id: str) -> Dict:
+        """Get comprehensive feature tracking information"""
+        
+        original_features = get_sensitive_features_metadata(original_dataset_id)
+        mitigated_features = get_sensitive_features_metadata(mitigated_dataset_id)
+        transformations = get_feature_transformation_metadata(mitigated_dataset_id)
+        
+        return {
+            'original_sensitive_features': len(original_features),
+            'preserved_sensitive_features': len(mitigated_features),
+            'feature_transformations': transformations,
+            'preservation_rate': len(mitigated_features) / len(original_features) if original_features else 0
+        }
         
     def apply_mitigation_strategy(
         self, 
